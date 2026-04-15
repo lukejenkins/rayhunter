@@ -37,6 +37,7 @@ use utoipa::OpenApi;
         diag::delete_recording,
         diag::delete_all_recordings,
         diag::get_analysis_report,
+        diag::get_diag_stream,
         analysis::get_analysis_status,
         analysis::start_analysis,
         server::get_config,

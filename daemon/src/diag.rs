@@ -14,7 +14,8 @@ use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, oneshot};
-use tokio_stream::wrappers::LinesStream;
+use tokio_stream::wrappers::{BroadcastStream, LinesStream};
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_util::task::TaskTracker;
 
 #[cfg(feature = "apidocs")]
@@ -443,6 +444,68 @@ pub fn run_diag_read_thread(
             }
         }
     });
+}
+
+/// Stream the raw /dev/diag byte stream to an HTTP client so a second
+/// consumer (QCSuper, etc.) can coexist with rayhunter.
+///
+/// The response body is the same byte stream rayhunter reads from
+/// /dev/diag in memory-device mode — Qualcomm DIAG `MessagesContainer`
+/// records (outer framing is `data_type: u32 LE` + `num_messages: u32 LE`
+/// + repeated `{len: u32 LE, [u8; len]}`; the HDLC-framed payloads live
+/// inside each inner message's `data`). Each subscriber gets its own view
+/// via a bounded broadcast channel; slow subscribers drop frames rather
+/// than stalling rayhunter's parser.
+#[cfg_attr(feature = "apidocs", utoipa::path(
+    get,
+    path = "/api/diag/stream",
+    tag = "Diag",
+    responses(
+        (
+            status = StatusCode::OK,
+            description = "Streaming raw /dev/diag bytes",
+            content_type = "application/octet-stream"
+        ),
+        (
+            status = StatusCode::SERVICE_UNAVAILABLE,
+            description = "diag_stream_enabled is false or debug_mode is true in the running config"
+        )
+    ),
+    summary = "Stream raw /dev/diag bytes",
+    description = "Subscribe to the raw /dev/diag byte stream. Returns \
+        HTTP chunked responses carrying the same Qualcomm DIAG \
+        memory-device-mode `MessagesContainer` records rayhunter reads \
+        from /dev/diag. Requires `diag_stream_enabled = true` and \
+        `debug_mode = false`. Exposes cellular protocol traces over the \
+        network — bind the daemon accordingly."
+))]
+pub async fn get_diag_stream(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Response, (StatusCode, String)> {
+    let Some(tx) = state.diag_stream_tx.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "diag stream not enabled; set diag_stream_enabled = true in config".to_string(),
+        ));
+    };
+
+    let rx = tx.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+        Ok(bytes) => future::ready(Some(Ok::<_, std::convert::Infallible>(
+            axum::body::Bytes::from(bytes),
+        ))),
+        Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+            warn!("diag_stream subscriber lagged, dropped {skipped} frames");
+            future::ready(None)
+        }
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .header("x-dtap-version", "1")
+        .body(Body::from_stream(stream))
+        .expect("valid response"))
 }
 
 /// Start recording API for web thread

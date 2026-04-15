@@ -14,6 +14,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::broadcast;
 use tokio::time::sleep;
 
 pub type DiagResult<T> = Result<T, DiagDeviceError>;
@@ -83,6 +84,14 @@ pub struct DiagDevice {
     file: File,
     read_buf: Vec<u8>,
     use_mdm: i32,
+    /// Optional tee. When set, each raw /dev/diag read is forwarded to
+    /// subscribers before parsing. `broadcast::Sender::send()` only
+    /// errors when there are no active receivers — those errors are
+    /// intentionally ignored. A full bounded channel never errors on
+    /// send; it overwrites and slow subscribers observe
+    /// `RecvError::Lagged(n)` on recv, so a slow consumer cannot stall
+    /// the parser.
+    tap: Option<broadcast::Sender<Vec<u8>>>,
 }
 
 impl DiagDevice {
@@ -144,7 +153,15 @@ impl DiagDevice {
             read_buf: vec![0; BUFFER_LEN],
             file: diag_file,
             use_mdm,
+            tap: None,
         })
+    }
+
+    /// Attach a broadcast sender that receives each raw /dev/diag read
+    /// before parsing. Sends are fire-and-forget (see the `tap` field
+    /// docs), so slow or absent consumers never slow the parser.
+    pub fn set_tap(&mut self, tap: broadcast::Sender<Vec<u8>>) {
+        self.tap = Some(tap);
     }
 
     pub fn as_stream(
@@ -172,6 +189,14 @@ impl DiagDevice {
             bytes_read,
             &self.read_buf[0..bytes_read]
         );
+
+        if let Some(tap) = &self.tap {
+            // Fire-and-forget: `send()` only errors when there are no
+            // active receivers. A full bounded channel silently overwrites
+            // and slow subscribers observe `RecvError::Lagged(n)` on recv,
+            // so the parser never gates on a consumer's speed.
+            let _ = tap.send(self.read_buf[0..bytes_read].to_vec());
+        }
 
         match MessagesContainer::from_bytes((&self.read_buf[0..bytes_read], 0)) {
             Ok((_, container)) => Ok(container),

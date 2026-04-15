@@ -35,7 +35,7 @@ use axum::response::Redirect;
 use axum::routing::{get, post};
 use diag::{
     DiagDeviceCtrlMessage, delete_all_recordings, delete_recording, get_analysis_report,
-    start_recording, stop_recording,
+    get_diag_stream, start_recording, stop_recording,
 };
 use log::{error, info};
 use qmdl_store::RecordingStoreError;
@@ -45,6 +45,7 @@ use stats::get_log;
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio::sync::RwLock;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -65,6 +66,7 @@ fn get_router() -> AppRouter {
         .route("/api/delete-recording/{name}", post(delete_recording))
         .route("/api/delete-all-recordings", post(delete_all_recordings))
         .route("/api/analysis-report/{name}", get(get_analysis_report))
+        .route("/api/diag/stream", get(get_diag_stream))
         .route("/api/analysis", get(get_analysis_status))
         .route("/api/analysis/{name}", post(start_analysis))
         .route("/api/config", get(get_config))
@@ -214,6 +216,19 @@ async fn run_with_config(
 
     let notification_service = NotificationService::new(config.ntfy_url.clone());
 
+    // Broadcast channel for the raw /dev/diag byte stream served by
+    // GET /api/diag/stream. Only constructed when the feature is enabled
+    // AND we have a real DiagDevice (i.e. not in debug mode); when None,
+    // the handler returns 503 so clients see a clear signal instead of
+    // hanging on a channel nobody writes to.
+    let diag_stream_tx =
+        if config.diag_stream_enabled && !config.debug_mode {
+            let (tx, _) = broadcast::channel::<Vec<u8>>(128);
+            Some(tx)
+        } else {
+            None
+        };
+
     if !config.debug_mode {
         info!("Using configuration for device: {0:?}", config.device);
         let mut dev = DiagDevice::new(&config.device)
@@ -222,6 +237,11 @@ async fn run_with_config(
         dev.config_logs()
             .await
             .map_err(RayhunterError::DiagInitError)?;
+
+        if let Some(tx) = diag_stream_tx.as_ref() {
+            info!("diag_stream enabled; GET /api/diag/stream will serve raw DIAG bytes");
+            dev.set_tap(tx.clone());
+        }
 
         info!("Starting Diag Thread");
         run_diag_read_thread(
@@ -297,6 +317,7 @@ async fn run_with_config(
         analysis_sender: analysis_tx,
         daemon_restart_token: restart_token.clone(),
         ui_update_sender: Some(ui_update_tx),
+        diag_stream_tx,
     });
     run_server(&task_tracker, state, shutdown_token.clone()).await;
 

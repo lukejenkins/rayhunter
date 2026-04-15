@@ -22,3 +22,21 @@ Through web UI you can set:
 - With **Analyzer Heuristic Settings** you can switch on or off built-in [Rayhunter heuristics](heuristics.md). Some heuristics are experimental or can trigger a lot of false positive warnings in some networks (our tests have shown that some heuristics have different behavior in US or European networks). In that case you can decide whether you would like to have the heuristics that trigger a lot of false positives on or off. Please note that we are constantly improving and adding new heuristics, so a new release may reduce false positives in existing heuristics as well.
 
 If you prefer editing `config.toml` file, you need to obtain a shell on your [Orbic](./orbic.md#obtaining-a-shell) or [TP-Link](./tplink-m7350.md#obtaining-a-shell) device and edit the file manually. You can view the [default configuration file on GitHub](https://github.com/EFForg/rayhunter/blob/main/dist/config.toml.in).
+
+## Raw `/dev/diag` byte-stream tap (advanced)
+
+The kernel's diag character device only allows one consumer in memory-device mode at a time, so by default no other tool (QCSuper, etc.) can read `/dev/diag` while rayhunter is running. Setting `diag_stream_enabled = true` tells rayhunter to expose the same bytes it reads from `/dev/diag` in memory-device mode (Qualcomm DIAG `MessagesContainer` records; HDLC framing lives inside each inner message's payload) through a streaming HTTP endpoint:
+
+```
+GET /api/diag/stream
+```
+
+The response body is `application/octet-stream` — raw DIAG bytes byte-for-byte identical to what a direct `/dev/diag` consumer would see. The `X-DTAP-Version` response header identifies the wire-format version so consumers can reject incompatible versions. Multiple clients may connect simultaneously; each gets its own view via a bounded broadcast channel. A slow client observes frame drops (documented by a warning in the daemon log) but cannot stall rayhunter's own analysis.
+
+A quick smoke test once the feature is enabled:
+
+```sh
+curl -N http://<device-ip>:8080/api/diag/stream | xxd | head
+```
+
+**Security note:** the endpoint has no authentication, matching the rest of the rayhunter API. DIAG traces include cellular protocol data — only enable this on networks you trust. When disabled (the default), the endpoint returns `503 Service Unavailable`.

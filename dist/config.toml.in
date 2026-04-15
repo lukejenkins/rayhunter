@@ -34,6 +34,16 @@ min_space_to_start_recording_mb = 1
 # Minimum free space (MB) to continue recording (stops if below this)
 min_space_to_continue_recording_mb = 1
 
+# Raw /dev/diag byte-stream tap.
+# When true, rayhunter exposes the same bytes it reads from /dev/diag in
+# memory-device mode (Qualcomm DIAG `MessagesContainer` records; HDLC
+# framing lives inside each inner message) via GET /api/diag/stream, so a
+# second tool (QCSuper, etc.) can coexist with rayhunter's IMSI-catcher
+# analysis without the kernel refusing a second /dev/diag consumer.
+# Exposes cellular protocol traces over the network — leave off unless
+# you know you need it.
+diag_stream_enabled = false
+
 # Analyzer Configuration
 # Enable/disable specific IMSI catcher detection heuristics
 # See https://github.com/EFForg/rayhunter/blob/main/doc/heuristics.md for details

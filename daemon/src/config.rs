@@ -34,6 +34,10 @@ pub struct Config {
     pub analyzers: AnalyzerConfig,
     pub min_space_to_start_recording_mb: u64,
     pub min_space_to_continue_recording_mb: u64,
+    /// When true, exposes the raw /dev/diag byte stream via
+    /// GET /api/diag/stream so a second consumer (QCSuper, etc.)
+    /// can coexist with rayhunter's IMSI-catcher analysis. Default off.
+    pub diag_stream_enabled: bool,
 }
 
 impl Default for Config {
@@ -51,6 +55,7 @@ impl Default for Config {
             enabled_notifications: vec![NotificationType::Warning, NotificationType::LowBattery],
             min_space_to_start_recording_mb: 1,
             min_space_to_continue_recording_mb: 1,
+            diag_stream_enabled: false,
         }
     }
 }

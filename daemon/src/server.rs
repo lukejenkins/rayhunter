@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::fs::write;
 use tokio::io::{AsyncReadExt, copy, duplex};
 use tokio::sync::RwLock;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::Sender;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use tokio_util::io::ReaderStream;
@@ -38,6 +39,10 @@ pub struct ServerState {
     pub analysis_sender: Sender<AnalysisCtrlMessage>,
     pub daemon_restart_token: CancellationToken,
     pub ui_update_sender: Option<Sender<DisplayState>>,
+    /// Broadcast sender for the raw /dev/diag byte stream, populated iff
+    /// `config.diag_stream_enabled` is true. GET /api/diag/stream subscribes
+    /// to this; when `None`, the endpoint returns 503.
+    pub diag_stream_tx: Option<broadcast::Sender<Vec<u8>>>,
 }
 
 #[cfg_attr(feature = "apidocs", utoipa::path(
@@ -504,6 +509,7 @@ mod tests {
             analysis_sender: analysis_tx,
             daemon_restart_token: CancellationToken::new(),
             ui_update_sender: None,
+            diag_stream_tx: None,
         })
     }
 
