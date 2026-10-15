@@ -308,16 +308,39 @@ struct DiagLoggingModeParam {
     req_mode: u32,
     peripheral_mask: u32,
     mode_param: u8,
+    // Zero padding out to the 24-byte layout below. The kernel never learns the user buffer's
+    // size and copies its own sizeof(), so older kernels never read this, while newer ones read
+    // zeros here instead of whatever is on our stack.
+    _pad: [u8; 15],
+}
+
+// Newer msm diagchar drivers (e.g. the 4.14 kernel on the SDX55-based Orbic R500L5) define a
+// 24-byte diag_logging_mode_param_t and copy that many bytes from userspace regardless of what
+// we pass, so the short struct above gets trailing stack garbage read as pd_mask/device_mask and
+// is rejected. Only tried after the short layouts fail, since older devices reject this one.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DiagLoggingModeParamExt {
+    req_mode: u32,
+    peripheral_mask: u32,
+    pd_mask: u32,
+    mode_param: u16,
+    diag_id: u8,
+    reserved: u8,
+    peripheral: i32,
+    device_mask: i32,
 }
 
 // Triggers the diag device's debug logging mode
 fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> DiagResult<()> {
     unsafe {
         if libc::ioctl(fd, DIAG_IOCTL_SWITCH_LOGGING, mode, 0, 0, 0) < 0 {
+            info!("SWITCH_LOGGING by-value failed: {}", std::io::Error::last_os_error());
             let mut try_params = vec![DiagLoggingModeParam {
                 req_mode: mode,
                 peripheral_mask: u32::MAX,
                 mode_param: 0,
+                _pad: [0; 15],
             }];
             if configured_device == &Device::Tplink {
                 // tplink M7350 HW revision 3-8 need this mode
@@ -327,6 +350,7 @@ fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> Dia
                         req_mode: mode,
                         peripheral_mask: 0,
                         mode_param: 1,
+                        _pad: [0; 15],
                     },
                 );
             }
@@ -345,13 +369,44 @@ fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> Dia
                     0,
                     0,
                 );
+                info!(
+                    "SWITCH_LOGGING short struct {params:?} -> {ret} ({})",
+                    std::io::Error::last_os_error()
+                );
                 if ret == 0 {
                     break;
                 }
             }
 
             if ret < 0 {
-                let msg = format!("DIAG_IOCTL_SWITCH_LOGGING ioctl failed with error code {ret}");
+                let mut params = DiagLoggingModeParamExt {
+                    req_mode: mode,
+                    // all peripherals (APSS, MPSS, LPASS, WCNSS, SENSORS, ...)
+                    peripheral_mask: 0x7f,
+                    pd_mask: 0,
+                    mode_param: 0,
+                    diag_id: 0,
+                    reserved: 0,
+                    peripheral: 0,
+                    // local processor
+                    device_mask: 1,
+                };
+                ret = libc::ioctl(
+                    fd,
+                    DIAG_IOCTL_SWITCH_LOGGING,
+                    &mut params as *mut DiagLoggingModeParamExt,
+                );
+                info!(
+                    "SWITCH_LOGGING 24-byte struct -> {ret} ({})",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                let msg = format!(
+                    "DIAG_IOCTL_SWITCH_LOGGING ioctl failed with error code {ret} ({err})"
+                );
                 return Err(DiagDeviceError::InitializationFailed(msg));
             }
         }
@@ -362,12 +417,15 @@ fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> Dia
 // Unsure of what MDM actually stands for, but if `use_mdm` is > 0, then
 // an additional mask is included in every diag request
 fn determine_use_mdm(fd: i32) -> DiagResult<i32> {
-    let use_mdm: i32 = 0;
+    // the kernel writes the remote-device mask into this, so it must be mutable: passing an
+    // immutable binding as *const lets the optimizer assume it is still 0
+    let mut use_mdm: i32 = 0;
     unsafe {
-        if libc::ioctl(fd, DIAG_IOCTL_REMOTE_DEV, &use_mdm as *const i32) < 0 {
+        if libc::ioctl(fd, DIAG_IOCTL_REMOTE_DEV, &mut use_mdm as *mut i32) < 0 {
             let msg = format!("DIAG_IOCTL_REMOTE_DEV ioctl failed with error code {}", 0);
             return Err(DiagDeviceError::InitializationFailed(msg));
         }
     }
+    info!("DIAG_IOCTL_REMOTE_DEV: remote device mask = {use_mdm:#x}");
     Ok(use_mdm)
 }
