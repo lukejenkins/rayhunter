@@ -89,7 +89,10 @@ pub enum LogBody {
     #[deku(id = "0xb062")]
     LteMacRachResponse { packet: mac::Packet },
     #[deku(id = "0xb063")]
-    LteMacDl { packet: mac::Packet },
+    LteMacDl {
+        #[deku(ctx = "hdr_len")]
+        packet: mac::DlTransportBlock,
+    },
     #[deku(id = "0xb064")]
     LteMacUl { packet: mac::Packet },
     #[deku(id = "0xb114")]

@@ -35,6 +35,34 @@ pub enum SubpacketBody {
     },
 }
 
+/// LTE MAC DL transport block (0xB063), keyed on the version byte.
+///
+/// v0x01 has the same subpacket container as [`Packet`] (0xB062/0xB064).
+/// v0x31, sent by SDX55-class modems such as the Orbic R500L5, is a flat
+/// layout: an 8-byte header, 532 bytes of per-cell statistics, then
+/// `num_entries` transport block entries. Entries can carry a variable-length
+/// extension, so they are kept as raw bytes rather than framed here.
+#[derive(DekuRead, DekuWrite, Debug, Clone, PartialEq)]
+#[deku(id_type = "u8", ctx = "hdr_len: u16")]
+pub enum DlTransportBlock {
+    #[deku(id = "0x01")]
+    V1 {
+        num_subpackets: u8,
+        #[deku(pad_bytes_before = "2", count = "num_subpackets")]
+        subpackets: Vec<Subpacket>,
+    },
+    #[deku(id = "0x31")]
+    V31 {
+        unknown1: [u8; 3],
+        num_entries: u16,
+        unknown2: u16,
+        #[deku(count = "532")]
+        cell_stats: Vec<u8>,
+        #[deku(count = "hdr_len.saturating_sub(540)")]
+        entries: Vec<u8>,
+    },
+}
+
 pub mod rach {
     //! Derived from https://github.com/fgsect/scat/blob/9763cb5b1dcd5ee980f5b0ead9a8d520c8c51a51/src/scat/parsers/qualcomm/diagltelogparser.py#L496
     use super::*;
@@ -225,6 +253,7 @@ pub(crate) mod test {
     //! https://github.com/wgreenberg/scat/commit/adb21575832b4f3b30c8f2aaca9ee843ef74f38b
 
     use super::*;
+    use crate::diag::diaglog::LogBody;
     use crate::diag::diaglog::mac::rach::{AdditionalInfo, AttemptHeader, Msg1, Msg2, Msg3};
     use crate::{diag::diaglog::mac::rach::Msg3Grant, test_util::unhexlify};
 
@@ -484,5 +513,133 @@ pub(crate) mod test {
                 unk2: 1306,
             }),
         );
+    }
+
+    // Orbic R500L5 (SDX55), fw ORB500L5_V2.0.4.3_BVZRT: v0x31 logs.
+    // 568 bytes, 1 entry
+    const R500L5_DL_V31_1_ENTRY: &str = concat!(
+        "3100000001000400c1420000040000000000000005000000000000000500000005000000c2440000000000000000000000000000000000000000000000000000",
+        "c3060300000000000000000000000000000000000000000000000000c40802000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000b00000008000000d95f000060010200bb00001f0000000000000000",
+    );
+    // 612 bytes, 3 entries
+    const R500L5_DL_V31_3_ENTRIES: &str = concat!(
+        "3100000003000400c1420000050000000000000006000000000000000600000006000000c2440000000000000000000000000000000000000000000000000000",
+        "c3060300000000000000000000000000000000000000000000000000c40802000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000b00000006000000255f0000500103000201000000000000000000000b00000006000000",
+        "27472000600103000201000000000000000000000b0000000b000000270b000070000100",
+    );
+    // Orbic RC400L (MDM9207): a v0x01 log with one 0x07 v0x02 subpacket. The
+    // subpacket body is opaque to the parser and was zeroed before vendoring.
+    const RC400L_DL_V1: &str = "01010100070218000000000000000000000000000000000000000000";
+
+    fn parse_dl_log_body(hexlified_bytes: &str) -> Result<LogBody, DekuError> {
+        let (total_size, mut reader) = unhexlify(hexlified_bytes);
+        LogBody::from_reader_with_ctx(&mut reader, (0xb063, total_size as u16))
+    }
+
+    #[test]
+    fn test_dl_v31_is_parsed() {
+        let parsed = parse_dl_log_body(R500L5_DL_V31_1_ENTRY);
+        assert!(
+            matches!(parsed, Ok(LogBody::LteMacDl { .. })),
+            "{:?}",
+            parsed
+        );
+    }
+
+    fn parse_dl(hexlified_bytes: &str) -> DlTransportBlock {
+        let (total_size, mut reader) = unhexlify(hexlified_bytes);
+        let packet = match LogBody::from_reader_with_ctx(&mut reader, (0xb063, total_size as u16)) {
+            Ok(LogBody::LteMacDl { packet }) => packet,
+            other => panic!("expected LteMacDl, got {:?}", other),
+        };
+        let leftover_bytes = total_size - reader.stream_position().unwrap() as usize;
+        assert_eq!(leftover_bytes, 0);
+        packet
+    }
+
+    fn hex_bytes(hexlified_bytes: &str) -> Vec<u8> {
+        (0..hexlified_bytes.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hexlified_bytes[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_dl_v31_one_entry() {
+        let DlTransportBlock::V31 {
+            unknown1,
+            num_entries,
+            unknown2,
+            cell_stats,
+            entries,
+        } = parse_dl(R500L5_DL_V31_1_ENTRY)
+        else {
+            panic!("expected V31");
+        };
+        let raw = hex_bytes(R500L5_DL_V31_1_ENTRY);
+        assert_eq!(unknown1, [0, 0, 0]);
+        assert_eq!(num_entries, 1);
+        assert_eq!(unknown2, 4);
+        assert_eq!(cell_stats, raw[8..540]);
+        assert_eq!(entries, raw[540..]);
+        assert_eq!(entries.len(), 28);
+    }
+
+    #[test]
+    fn test_dl_v31_three_entries() {
+        let DlTransportBlock::V31 {
+            num_entries,
+            entries,
+            ..
+        } = parse_dl(R500L5_DL_V31_3_ENTRIES)
+        else {
+            panic!("expected V31");
+        };
+        assert_eq!(num_entries, 3);
+        assert_eq!(entries, hex_bytes(R500L5_DL_V31_3_ENTRIES)[540..]);
+        assert_eq!(entries.len(), 72);
+    }
+
+    #[test]
+    fn test_dl_v1_is_unchanged() {
+        assert_eq!(
+            parse_dl(RC400L_DL_V1),
+            DlTransportBlock::V1 {
+                num_subpackets: 1,
+                subpackets: vec![Subpacket {
+                    id: 0x07,
+                    version: 0x02,
+                    size: 24,
+                    body: SubpacketBody::Other { data: vec![0; 20] },
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn test_dl_v31_shorter_than_its_cell_stats_is_rejected() {
+        let truncated = &R500L5_DL_V31_1_ENTRY[..2 * 300];
+        assert!(parse_dl_log_body(truncated).is_err());
+    }
+
+    #[test]
+    fn test_dl_unknown_version_is_still_rejected() {
+        let mut other = String::from("32");
+        other.push_str(&R500L5_DL_V31_1_ENTRY[2..]);
+        assert!(parse_dl_log_body(&other).is_err());
     }
 }
