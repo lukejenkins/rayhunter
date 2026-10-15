@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use log::debug;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_serial::SerialPortBuilderExt;
 
 use crate::plmn::{PACKED_BCD_LEN, decode_packed_bcd};
@@ -75,22 +75,24 @@ fn is_normal_ending(sw1: u8, sw2: u8) -> bool {
 /// <https://github.com/osmocom/pysim/blob/25e43e1540144be9026a2733bc3a4271b8fa7d25/pySim/transport/modem_atcmd.py#L108-L124>
 async fn send_at_command(port: &str, command: &str) -> Result<String, SimError> {
     let at = async {
-        let mut serial = tokio_serial::new(port, BAUD_RATE)
-            .open_native_async()
-            .map_err(|e| SimError::AtCommandError(format!("couldn't open {port}: {e}")))?;
-
-        serial.write_all(format!("{command}\r").as_bytes()).await?;
-
-        let mut response = String::new();
-        let mut chunk = [0u8; 512];
-        while !is_terminated(&response) {
-            let n = serial.read(&mut chunk).await?;
-            if n == 0 {
-                break;
+        match tokio_serial::new(port, BAUD_RATE).open_native_async() {
+            Ok(mut serial) => exchange(&mut serial, command).await,
+            // Some SMD channels are packet devices rather than ttys (/dev/smd7 on
+            // an Orbic R500L5), so setting up termios fails with ENOTTY. They
+            // take plain reads and writes.
+            Err(e) if is_not_a_tty(&e) => {
+                debug!("{port} is not a tty, using plain reads and writes");
+                let mut file = tokio::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(port)
+                    .await?;
+                exchange(&mut file, command).await
             }
-            response.push_str(&String::from_utf8_lossy(&chunk[..n]));
+            Err(e) => Err(SimError::AtCommandError(format!(
+                "couldn't open {port}: {e}"
+            ))),
         }
-        Ok::<_, SimError>(response)
     };
 
     let response = tokio::time::timeout(TIMEOUT, at).await.map_err(|_| {
@@ -99,6 +101,31 @@ async fn send_at_command(port: &str, command: &str) -> Result<String, SimError> 
 
     debug!("AT command {command:?} -> {response:?}");
     Ok(response)
+}
+
+async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    command: &str,
+) -> Result<String, SimError> {
+    stream.write_all(format!("{command}\r").as_bytes()).await?;
+
+    let mut response = String::new();
+    let mut chunk = [0u8; 512];
+    while !is_terminated(&response) {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        response.push_str(&String::from_utf8_lossy(&chunk[..n]));
+    }
+    Ok(response)
+}
+
+/// serialport reports a termios `ENOTTY` as `ErrorKind::Unknown`, described
+/// with nix's text for the errno.
+fn is_not_a_tty(e: &tokio_serial::Error) -> bool {
+    e.kind() == tokio_serial::ErrorKind::Unknown
+        && e.to_string() == nix::errno::Errno::ENOTTY.desc()
 }
 
 /// Whether a response buffer has reached a final result code. Same set pysim
@@ -194,6 +221,44 @@ fn parse_hplmnwact(payload: &[u8]) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A regular file stands in for a non-tty SMD channel: setting up termios
+    /// on it fails with ENOTTY too. The file starts with the echo of the
+    /// command, which the write overwrites in place, followed by a canned
+    /// reply (the real Orbic payload from `parses_real_orbic_payload`).
+    fn non_tty_port(reply: &str) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), format!("{READ_EF_HPLMNWACT}\r{reply}")).unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn opening_a_non_tty_reports_not_a_tty() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let e = tokio_serial::new(path, BAUD_RATE)
+            .open_native_async()
+            .expect_err("a regular file is not a tty");
+        assert!(is_not_a_tty(&e), "unexpected error: {e:?}");
+    }
+
+    #[tokio::test]
+    async fn reads_home_plmn_from_a_non_tty_port() {
+        let port = non_tty_port("\r\n+CRSM: 144,0,\"1301844000FFFFFF0000\"\r\n\r\nOK\r\n");
+        let plmns = get_home_plmn(port.path().to_str().unwrap()).await.unwrap();
+        assert_eq!(plmns, set(&["311-480"]));
+    }
+
+    #[tokio::test]
+    async fn other_open_errors_are_still_reported() {
+        let e = send_at_command("/nonexistent/smd7", READ_EF_HPLMNWACT)
+            .await
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("couldn't open /nonexistent/smd7"),
+            "unexpected error: {e}"
+        );
+    }
 
     fn set(plmns: &[&str]) -> BTreeSet<String> {
         plmns.iter().map(|p| p.to_string()).collect()
