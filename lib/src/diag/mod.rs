@@ -138,9 +138,28 @@ pub enum Message {
     },
 }
 
+/// DIAG_MULTI_RADIO_CMD_F: some SDX55-and-later modems (e.g. the Orbic R500L5) deliver log
+/// packets inside this envelope: an 8-byte header (0x98, envelope version, 2 reserved bytes, u32
+/// id) followed by an ordinary diag message. The outer HDLC frame carries the only CRC, so after
+/// decapsulation the inner message is everything after the header.
+const DIAG_MULTI_RADIO_CMD_F: u8 = 0x98;
+const MULTI_RADIO_VERSION: u8 = 0x01;
+const MULTI_RADIO_HEADER_LEN: usize = 8;
+
+/// Strips a multi-radio envelope, if there is one. Messages without one are returned unchanged.
+fn unwrap_multi_radio(mut data: Vec<u8>) -> Vec<u8> {
+    if data.len() > MULTI_RADIO_HEADER_LEN
+        && data[0] == DIAG_MULTI_RADIO_CMD_F
+        && data[1] == MULTI_RADIO_VERSION
+    {
+        data.drain(..MULTI_RADIO_HEADER_LEN);
+    }
+    data
+}
+
 impl Message {
     pub fn from_hdlc(data: &[u8]) -> Result<Message, DiagParsingError> {
-        match hdlc_decapsulate(data, &CRC_CCITT) {
+        match hdlc_decapsulate(data, &CRC_CCITT).map(unwrap_multi_radio) {
             Ok(data) => match Message::from_bytes((&data, 0)) {
                 Ok(((leftover_bytes, _), res)) => {
                     if !leftover_bytes.is_empty() {

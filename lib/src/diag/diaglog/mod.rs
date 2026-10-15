@@ -355,6 +355,76 @@ pub(crate) mod test {
         assert_eq!(container.messages(), vec![Ok(message1), Ok(message2)]);
     }
 
+    // The same uplink EMM message type (a Service Request) as logged by two devices: plain on an
+    // Orbic RC400L (MDM9607), and inside a 0x98 multi-radio envelope on an Orbic R500L5 (SDX55),
+    // which wraps every log packet it sends.
+    const RC400L_PLAIN_EMM_FRAME: &str = "100014001400edb0ed2a1b27262e0b0101090500c7aaf1e374847e";
+    const R500L5_WRAPPED_EMM_FRAME: &str =
+        "9801000001000000100014001400edb02c20bfbfa3ee120101090500c77764f7ba587e";
+
+    fn hex_to_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn assert_uplink_emm(message: &Message, expected_msg: &[u8]) {
+        match message {
+            Message::Log {
+                log_type: 0xb0ed,
+                body:
+                    LogBody::Nas4GMessage {
+                        direction: Nas4GMessageDirection::Uplink,
+                        msg,
+                        ..
+                    },
+                ..
+            } => assert_eq!(msg, expected_msg),
+            other => panic!("expected an uplink EMM message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plain_message_from_rc400l() {
+        let frame = hex_to_bytes(RC400L_PLAIN_EMM_FRAME);
+        let message = Message::from_hdlc(&frame).unwrap();
+        assert_uplink_emm(&message, &[0xc7, 0xaa, 0xf1, 0xe3]);
+    }
+
+    #[test]
+    fn test_multi_radio_wrapped_message_from_r500l5() {
+        let frame = hex_to_bytes(R500L5_WRAPPED_EMM_FRAME);
+        let message = Message::from_hdlc(&frame).unwrap();
+        assert_uplink_emm(&message, &[0xc7, 0x77, 0x64, 0xf7]);
+
+        // unwrapping gives the same result as receiving the inner message on its own
+        let decapsulated = hdlc::hdlc_decapsulate(&frame, &CRC_CCITT).unwrap();
+        let inner = hdlc::hdlc_encapsulate(&decapsulated[8..], &CRC_CCITT);
+        assert_eq!(Message::from_hdlc(&inner).unwrap(), message);
+    }
+
+    #[test]
+    fn test_multi_radio_unknown_version_not_unwrapped() {
+        let frame = hex_to_bytes(R500L5_WRAPPED_EMM_FRAME);
+        let mut decapsulated = hdlc::hdlc_decapsulate(&frame, &CRC_CCITT).unwrap();
+        decapsulated[1] = 0x02;
+        let frame = hdlc::hdlc_encapsulate(&decapsulated, &CRC_CCITT);
+        assert!(matches!(
+            Message::from_hdlc(&frame),
+            Err(DiagParsingError::MessageParsingError(_, _))
+        ));
+    }
+
+    #[test]
+    fn test_multi_radio_header_only_not_unwrapped() {
+        let frame = hdlc::hdlc_encapsulate(&[0x98, 0x01, 0, 0, 1, 0, 0, 0], &CRC_CCITT);
+        assert!(matches!(
+            Message::from_hdlc(&frame),
+            Err(DiagParsingError::MessageParsingError(_, _))
+        ));
+    }
+
     #[test]
     fn test_handles_parsing_errors() {
         let (encapsulated1, message1) = get_test_message(&[1]);
