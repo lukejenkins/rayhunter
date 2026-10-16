@@ -243,6 +243,19 @@ impl DiagTask {
         }
     }
 
+    /// Finish the current recording because the daemon is exiting. The
+    /// writers are closed (which flushes the gzip trailer) and the final
+    /// QMDL size recorded **before** the entry is closed, so the manifest
+    /// size matches the file on disk.
+    async fn stop_for_exit(&mut self, qmdl_store: &mut RecordingStore) {
+        self.stop_current_recording(qmdl_store).await;
+        if qmdl_store.current_entry.is_some()
+            && let Err(e) = qmdl_store.close_current_entry().await
+        {
+            error!("couldn't close current entry: {e}");
+        }
+    }
+
     async fn delete_entry(
         &mut self,
         qmdl_store: &mut RecordingStore,
@@ -519,7 +532,7 @@ pub fn run_diag_read_thread(
                         Some(DiagDeviceCtrlMessage::Exit) | None => {
                             info!("Diag reader thread exiting...");
                             let mut qmdl_store = qmdl_store_lock.write().await;
-                            diag_task.stop_current_recording(qmdl_store.deref_mut()).await;
+                            diag_task.stop_for_exit(qmdl_store.deref_mut()).await;
                             return Ok(())
                         },
                         Some(DiagDeviceCtrlMessage::DeleteEntry { name, response_tx }) => {
@@ -782,4 +795,64 @@ pub async fn get_analysis_report(
     let headers = [(CONTENT_TYPE, "application/x-ndjson")];
     let body = Body::from_stream(normalized_stream);
     Ok((headers, body).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_task() -> DiagTask {
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::channel(8);
+        let (analysis_tx, _analysis_rx) = tokio::sync::mpsc::channel(8);
+        let (notification_tx, _notification_rx) = tokio::sync::mpsc::channel(8);
+        DiagTask::new(
+            ui_tx,
+            analysis_tx,
+            AnalyzerConfig::default(),
+            // A device with no SIM backend, so start() doesn't touch an AT port.
+            Device::Pinephone,
+            notification_tx,
+            0,
+            0,
+            GpsMode::Disabled,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn stop_for_exit_records_the_final_qmdl_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RecordingStore::create(dir.path()).await.unwrap();
+        let mut task = make_task();
+        task.start(&mut store).await.unwrap();
+        let entry_idx = store.current_entry.unwrap();
+
+        task.stop_for_exit(&mut store).await;
+
+        assert_eq!(store.current_entry, None);
+        let entry = &store.manifest.entries[entry_idx];
+        let on_disk = std::fs::metadata(entry.get_filepath(FileKind::Qmdl, &store.path))
+            .unwrap()
+            .len() as usize;
+        // Closing the gzip writer always emits a header and trailer, so a
+        // size recorded before the close would be 0.
+        assert!(on_disk > 0);
+        assert_eq!(entry.qmdl_size_bytes, on_disk);
+        // The manifest on disk agrees with the in-memory one.
+        let reloaded = RecordingStore::load(dir.path()).await.unwrap();
+        assert_eq!(
+            reloaded.manifest.entries[entry_idx].qmdl_size_bytes,
+            on_disk
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_for_exit_without_a_recording_is_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RecordingStore::create(dir.path()).await.unwrap();
+        let mut task = make_task();
+        task.stop_for_exit(&mut store).await;
+        assert_eq!(store.current_entry, None);
+        assert!(store.manifest.entries.is_empty());
+    }
 }

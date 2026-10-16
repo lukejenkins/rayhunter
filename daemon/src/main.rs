@@ -149,7 +149,6 @@ fn run_shutdown_thread(
     task_tracker: &TaskTracker,
     diag_device_sender: Sender<DiagDeviceCtrlMessage>,
     shutdown_token: CancellationToken,
-    qmdl_store_lock: Arc<RwLock<RecordingStore>>,
     analysis_tx: Sender<AnalysisCtrlMessage>,
 ) -> JoinHandle<Result<(), RayhunterError>> {
     info!("create shutdown thread");
@@ -164,13 +163,8 @@ fn run_shutdown_thread(
             _ = shutdown_token.cancelled() => {}
         }
 
-        let mut qmdl_store = qmdl_store_lock.write().await;
-        if qmdl_store.current_entry.is_some() {
-            info!("Closing current QMDL entry...");
-            qmdl_store.close_current_entry().await?;
-            info!("Done!");
-        }
-
+        // The diag thread closes the current QMDL entry when it gets Exit,
+        // after closing the writers, so the entry's final size is recorded.
         shutdown_token.cancel();
         diag_device_sender
             .send(DiagDeviceCtrlMessage::Exit)
@@ -292,7 +286,6 @@ async fn run_with_config(
         &task_tracker,
         diag_tx.clone(),
         shutdown_token.clone(),
-        qmdl_store_lock.clone(),
         analysis_tx.clone(),
     );
 
