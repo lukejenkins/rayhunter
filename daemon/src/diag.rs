@@ -162,6 +162,9 @@ impl DiagTask {
             DiskSpaceCheck::Failed => {}
         }
 
+        // Close any running recording first, while it is still the current
+        // entry, so its final size goes to its own manifest entry.
+        self.stop_current_recording(qmdl_store).await;
         let (qmdl_gz_file, analysis_file) = qmdl_store.new_entry(self.gps_mode).await?;
 
         // For fixed-mode sessions, write the configured coordinates to the storage
@@ -189,7 +192,6 @@ impl DiagTask {
                 .await
                 .map_err(RecordingStoreError::WriteFileError)?;
         }
-        self.stop_current_recording(qmdl_store).await;
         let qmdl_writer = Box::new(QmdlWriter::new(qmdl_gz_file));
         let device_metadata = DeviceMetadata {
             home_plmn: rayhunter::sim::home_plmn(&self.device).await,
@@ -844,6 +846,25 @@ mod tests {
             reloaded.manifest.entries[entry_idx].qmdl_size_bytes,
             on_disk
         );
+    }
+
+    #[tokio::test]
+    async fn starting_over_a_recording_keeps_each_entrys_own_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RecordingStore::create(dir.path()).await.unwrap();
+        let mut task = make_task();
+        task.start(&mut store).await.unwrap();
+        task.start(&mut store).await.unwrap();
+        task.stop_for_exit(&mut store).await;
+
+        assert_eq!(store.manifest.entries.len(), 2);
+        for entry in &store.manifest.entries {
+            let on_disk = std::fs::metadata(entry.get_filepath(FileKind::Qmdl, &store.path))
+                .unwrap()
+                .len() as usize;
+            assert!(on_disk > 0);
+            assert_eq!(entry.qmdl_size_bytes, on_disk, "entry {}", entry.name);
+        }
     }
 
     #[tokio::test]
