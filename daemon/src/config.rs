@@ -84,6 +84,8 @@ pub struct Config {
     pub clock_sync_mode: ClockSyncMode,
     /// Map from analyzer key to whether it is enabled
     pub analyzers: AnalyzerConfig,
+    /// DIAG log codes to leave out of the log mask, e.g. to save disk space
+    pub excluded_log_codes: Vec<u32>,
     /// Minimum disk space required to start a recording
     pub min_space_to_start_recording_mb: u64,
     /// Minimum disk space required to continue a recording
@@ -158,6 +160,7 @@ impl Default for Config {
             enabled_notifications: vec![NotificationType::Warning, NotificationType::LowBattery],
             auto_check_updates: true,
             clock_sync_mode: ClockSyncMode::Prompt,
+            excluded_log_codes: vec![],
             min_space_to_start_recording_mb: 1,
             min_space_to_continue_recording_mb: 1,
             gps_mode: GpsMode::Disabled,
@@ -253,5 +256,22 @@ pub fn parse_args() -> Args {
     }
     Args {
         config_path: args[1].clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn excluded_log_codes_default_to_none() {
+        let config: Config = toml::from_str("port = 8080").unwrap();
+        assert!(config.excluded_log_codes.is_empty());
+    }
+
+    #[test]
+    fn excluded_log_codes_parse_as_hex() {
+        let config: Config = toml::from_str("excluded_log_codes = [0xb114, 0xb063]").unwrap();
+        assert_eq!(config.excluded_log_codes, vec![0xb114, 0xb063]);
     }
 }

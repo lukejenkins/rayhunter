@@ -234,6 +234,7 @@ async fn run_with_config(
             qmdl_store_lock.clone(),
             analysis_tx.clone(),
             config.analyzers.clone(),
+            config.excluded_log_codes.clone(),
             notification_service.new_handler(),
             config.min_space_to_start_recording_mb,
             config.min_space_to_continue_recording_mb,

@@ -46,6 +46,10 @@ clock_sync_mode = 2
 min_space_to_start_recording_mb = 1
 # Minimum free space (MB) to continue recording (stops if below this)
 min_space_to_continue_recording_mb = 1
+# DIAG log codes to leave out of recordings. On a device with little storage, dropping
+# a high-volume code makes a recording last longer, e.g. 0xb114 (LTE LL1 serving cell
+# frame timing) is about two thirds of all log packets on an Orbic R500L5.
+# excluded_log_codes = [0xb114]
 
 # WiFi Client Mode
 # Toggle wifi_enabled to connect the device to an existing WiFi network.

@@ -7,7 +7,7 @@ use crate::{Device, log_codes};
 
 use deku::prelude::*;
 use futures::TryStream;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
@@ -65,6 +65,15 @@ pub const LOG_CODES_FOR_RAW_PACKET_LOGGING: [u32; 17] = [
     log_codes::LOG_LTE_MAC_UL,
     0xb114, // maybe timing advance related?
 ];
+
+/// The log codes rayhunter enables, minus `excluded_log_codes`.
+pub fn log_codes_excluding(excluded_log_codes: &[u32]) -> Vec<u32> {
+    LOG_CODES_FOR_RAW_PACKET_LOGGING
+        .iter()
+        .copied()
+        .filter(|code| !excluded_log_codes.contains(code))
+        .collect()
+}
 
 const BUFFER_LEN: usize = 1024 * 1024 * 10;
 const MEMORY_DEVICE_MODE: u32 = 2;
@@ -251,12 +260,13 @@ impl DiagDevice {
         Err(DiagDeviceError::NoResponse(req))
     }
 
-    async fn set_log_mask(&mut self, log_type: u32, log_mask_bitsize: u32) -> DiagResult<()> {
-        let req = build_log_mask_request(
-            log_type,
-            log_mask_bitsize,
-            &LOG_CODES_FOR_RAW_PACKET_LOGGING,
-        );
+    async fn set_log_mask(
+        &mut self,
+        log_type: u32,
+        log_mask_bitsize: u32,
+        log_codes: &[u32],
+    ) -> DiagResult<()> {
+        let req = build_log_mask_request(log_type, log_mask_bitsize, log_codes);
         self.write_request(&req).await?;
 
         for msg in self.read_response().await? {
@@ -280,12 +290,27 @@ impl DiagDevice {
     }
 
     pub async fn config_logs(&mut self) -> DiagResult<()> {
+        self.config_logs_excluding(&[]).await
+    }
+
+    /// Like [`DiagDevice::config_logs`], but leaves the given log codes out of the mask.
+    pub async fn config_logs_excluding(&mut self, excluded_log_codes: &[u32]) -> DiagResult<()> {
+        let log_codes = log_codes_excluding(excluded_log_codes);
+        for code in excluded_log_codes {
+            if LOG_CODES_FOR_RAW_PACKET_LOGGING.contains(code) {
+                info!("not logging excluded log code {code:#06x}");
+            } else {
+                warn!("excluded log code {code:#06x} isn't one rayhunter enables");
+            }
+        }
+
         info!("retrieving diag logging capabilities...");
         let log_mask_sizes = self.retrieve_id_ranges().await?;
 
         for (log_type, &log_mask_bitsize) in log_mask_sizes.iter().enumerate() {
             if log_mask_bitsize > 0 {
-                self.set_log_mask(log_type as u32, log_mask_bitsize).await?;
+                self.set_log_mask(log_type as u32, log_mask_bitsize, &log_codes)
+                    .await?;
                 info!("enabled logging for log type {log_type}");
             }
         }
@@ -428,4 +453,31 @@ fn determine_use_mdm(fd: i32) -> DiagResult<i32> {
     }
     info!("DIAG_IOCTL_REMOTE_DEV: remote device mask = {use_mdm:#x}");
     Ok(use_mdm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn excluding_nothing_keeps_every_log_code() {
+        assert_eq!(log_codes_excluding(&[]), LOG_CODES_FOR_RAW_PACKET_LOGGING);
+    }
+
+    #[test]
+    fn excluded_log_codes_are_left_out() {
+        let log_codes = log_codes_excluding(&[0xb114, log_codes::LOG_LTE_MAC_DL]);
+        assert_eq!(log_codes.len(), LOG_CODES_FOR_RAW_PACKET_LOGGING.len() - 2);
+        assert!(!log_codes.contains(&0xb114));
+        assert!(!log_codes.contains(&log_codes::LOG_LTE_MAC_DL));
+        assert!(log_codes.contains(&log_codes::LOG_LTE_RRC_OTA_MSG_LOG_C));
+    }
+
+    #[test]
+    fn unknown_excluded_log_codes_change_nothing() {
+        assert_eq!(
+            log_codes_excluding(&[0xdead]),
+            LOG_CODES_FOR_RAW_PACKET_LOGGING
+        );
+    }
 }

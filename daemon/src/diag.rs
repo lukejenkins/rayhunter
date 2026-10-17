@@ -485,6 +485,7 @@ pub fn run_diag_read_thread(
     qmdl_store_lock: Arc<RwLock<RecordingStore>>,
     analysis_sender: Sender<AnalysisCtrlMessage>,
     analyzer_config: AnalyzerConfig,
+    excluded_log_codes: Vec<u32>,
     notification_channel: tokio::sync::mpsc::Sender<Notification>,
     min_space_to_start_mb: u64,
     min_space_to_continue_mb: u64,
@@ -495,7 +496,7 @@ pub fn run_diag_read_thread(
         info!("Using configuration for device: {0:?}", device);
         let mut dev = DiagDevice::new(&device)
             .await?;
-        dev.config_logs()
+        dev.config_logs_excluding(&excluded_log_codes)
             .await?;
 
         let mut diag_stream = pin!(dev.as_stream().into_stream());
