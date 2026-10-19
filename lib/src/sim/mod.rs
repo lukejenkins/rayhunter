@@ -21,7 +21,9 @@ pub enum SimError {
 /// failure, which callers must treat as "unknown".
 pub async fn home_plmn(device: &Device) -> BTreeSet<String> {
     let result = match device {
-        Device::Tplink | Device::Orbic => generic_at::get_home_plmn("/dev/smd7").await,
+        Device::Tplink | Device::Orbic | Device::R500l5 => {
+            generic_at::get_home_plmn("/dev/smd7").await
+        }
         _ => Err(SimError::UnsupportedDevice),
     };
 

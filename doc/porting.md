@@ -59,7 +59,7 @@ We're assuming that your device is ARMv7, i.e. 32-bit ARM (`armv7-unknown-linux-
 
 You can copy the daemon and config files to the device using `netcat` or `adb push`. They don't have to be in `/data/rayhunter/`, this is just convention. If you use a different path, be sure to update the `qmdl_store_path` setting in `config.toml`.
 
-The `device` setting in `config.toml` must match one of the lowercase variant names from the `Device` enum (e.g. `"orbic"`, `"tplink"`). This controls which display driver is used.
+The `device` setting in `config.toml` must match one of the lowercase variant names from the `Device` enum (e.g. `"orbic"`, `"tplink"`, `"r500l5"`). This controls which display driver is used.
 
 To bring the daemon up without `/dev/diag` (for instance, to test the display and web UI before the hardware path works), see [Running the daemon on your PC](./installing-from-source.md#running-the-daemon-on-your-pc).
 

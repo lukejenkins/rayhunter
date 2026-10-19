@@ -288,4 +288,12 @@ mod tests {
         let config: Config = toml::from_str("excluded_log_codes = [0xb114, 0xb063]").unwrap();
         assert_eq!(config.excluded_log_codes, vec![0xb114, 0xb063]);
     }
+
+    #[test]
+    fn r500l5_is_its_own_device() {
+        let config: Config = toml::from_str(r#"device = "r500l5""#).unwrap();
+        assert_eq!(config.device, Device::R500l5);
+        let config: Config = toml::from_str(r#"device = "orbic""#).unwrap();
+        assert_eq!(config.device, Device::Orbic);
+    }
 }

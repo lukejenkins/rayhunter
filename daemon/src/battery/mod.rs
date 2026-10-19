@@ -52,7 +52,7 @@ async fn get_level_from_percentage_file(path: &Path) -> Result<u8, RayhunterErro
 
 pub async fn get_battery_status(device: &Device) -> Result<BatteryState, RayhunterError> {
     Ok(match device {
-        Device::Orbic => orbic::get_battery_state().await?,
+        Device::Orbic | Device::R500l5 => orbic::get_battery_state().await?,
         Device::Wingtech => wingtech::get_battery_state().await?,
         Device::Tmobile => tmobile::get_battery_state().await?,
         Device::Tplink => tplink::get_battery_state().await?,
