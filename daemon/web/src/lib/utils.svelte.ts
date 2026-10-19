@@ -77,6 +77,7 @@ export interface Config {
     gps_mode: GpsMode;
     gps_fixed_latitude: number | null;
     gps_fixed_longitude: number | null;
+    gps_nmea_udp_address: string;
     gps_nmea_udp_port: number;
     gps_nmea_interval_secs: number;
 }

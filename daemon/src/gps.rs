@@ -178,19 +178,14 @@ fn nmea_degrees(value: &str, hemisphere: &str, degree_digits: usize) -> Option<f
 ///
 /// Only GGA with a non-zero fix quality and RMC with status `A` carry a
 /// position. Every other sentence, a sentence without a fix, and a sentence
-/// whose checksum does not match return `None`.
+/// with a missing or wrong checksum return `None`.
 pub fn parse_nmea_position(sentence: &str) -> Option<GpsData> {
     let body = sentence.trim().strip_prefix('$')?;
-    let body = match body.split_once('*') {
-        Some((data, checksum)) => {
-            let expected = u8::from_str_radix(checksum.get(..2)?, 16).ok()?;
-            if data.bytes().fold(0, |acc, b| acc ^ b) != expected {
-                return None;
-            }
-            data
-        }
-        None => body,
-    };
+    let (body, checksum) = body.split_once('*')?;
+    let expected = u8::from_str_radix(checksum.get(..2)?, 16).ok()?;
+    if body.bytes().fold(0, |acc, b| acc ^ b) != expected {
+        return None;
+    }
     let fields: Vec<&str> = body.split(',').collect();
     // The first two characters are the talker (GP, GN, GL, ...).
     let (lat, lat_hemisphere, lon, lon_hemisphere) = match fields.first()?.get(2..)? {
@@ -235,6 +230,7 @@ pub fn parse_nmea_position(sentence: &str) -> Option<GpsData> {
 /// several, separated by line breaks.
 pub fn run_nmea_gps_listener(
     task_tracker: &TaskTracker,
+    address: String,
     port: u16,
     interval: Duration,
     diag_device_sender: Sender<DiagDeviceCtrlMessage>,
@@ -242,14 +238,14 @@ pub fn run_nmea_gps_listener(
     shutdown_token: CancellationToken,
 ) {
     task_tracker.spawn(async move {
-        let socket = match UdpSocket::bind(("0.0.0.0", port)).await {
+        let socket = match UdpSocket::bind((address.as_str(), port)).await {
             Ok(socket) => socket,
             Err(e) => {
-                error!("failed to bind NMEA UDP port {port}: {e}");
+                error!("failed to bind NMEA UDP {address}:{port}: {e}");
                 return;
             }
         };
-        info!("Listening for NMEA sentences on UDP port {port}");
+        info!("Listening for NMEA sentences on UDP {address}:{port}");
         let mut last_recorded: Option<Instant> = None;
         let mut buf = [0u8; 2048];
         loop {
@@ -320,6 +316,14 @@ mod tests {
                 "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*48"
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn a_missing_checksum_is_ignored() {
+        assert!(
+            parse_nmea_position("$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,")
+                .is_none()
         );
     }
 

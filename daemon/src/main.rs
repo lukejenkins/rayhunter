@@ -344,6 +344,7 @@ async fn run_with_config(
     if config.gps_mode == GpsMode::Nmea && !config.debug_mode {
         gps::run_nmea_gps_listener(
             &task_tracker,
+            config.gps_nmea_udp_address.clone(),
             config.gps_nmea_udp_port,
             Duration::from_secs(config.gps_nmea_interval_secs),
             diag_tx.clone(),

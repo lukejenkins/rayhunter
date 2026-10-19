@@ -41,7 +41,7 @@ The modes are:
 
 - *API Endpoint*, enables the `POST /api/gps` endpoint so that third-party tools (i.e. your own scripts) can update location info continuously. Please refer to the [API documentation](api-docs.md) for more info.
 
-- *NMEA over UDP*, listens on a UDP port (12841 by default) for NMEA 0183 sentences, for example from the device's own GNSS receiver or a forwarder on the local network. Positions are taken from GGA sentences with a fix and RMC sentences with status `A`; sentences with a bad checksum are ignored. At most one position is recorded per interval (10 seconds by default).
+- *NMEA over UDP*, listens on a UDP address and port (127.0.0.1:12841 by default) for NMEA 0183 sentences, for example from the device's own GNSS receiver. Positions are taken from GGA sentences with a fix and RMC sentences with status `A`; sentences with a missing or wrong checksum are ignored. The sentences are not authenticated, so anyone who can send to the listen address can set the recorded position: keep the default loopback address unless you trust every host that can reach the one you choose. At most one position is recorded per interval (10 seconds by default).
 
 The GPS data is stored as a separate JSON file next to QMDL captures, and contains its own timestamps. These timestamps are meant to be compared during analysis with the packet timestamp so we know the time difference between the packet capture from the GPS capture, if there is any, since GPS data and packet data may come from two entirely separate devices.
 

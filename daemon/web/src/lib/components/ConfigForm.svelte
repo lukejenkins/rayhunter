@@ -662,6 +662,19 @@
                     {/if}
                     {#if config.gps_mode === GpsMode.Nmea}
                         <FormField
+                            id="gps_nmea_udp_address"
+                            label="NMEA Listen Address"
+                            help="127.0.0.1 accepts only senders on the device. Anyone who can reach another address can set the recorded position."
+                        >
+                            <input
+                                id="gps_nmea_udp_address"
+                                type="text"
+                                required
+                                bind:value={config.gps_nmea_udp_address}
+                                class="form-control w-full"
+                            />
+                        </FormField>
+                        <FormField
                             id="gps_nmea_udp_port"
                             label="NMEA UDP Port"
                             help="UDP port the NMEA sentences arrive on"

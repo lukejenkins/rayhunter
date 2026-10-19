@@ -99,6 +99,10 @@ pub struct Config {
     pub gps_fixed_latitude: Option<f64>,
     /// Fixed longitude used when gps_mode=1
     pub gps_fixed_longitude: Option<f64>,
+    /// Address to receive NMEA sentences on when gps_mode=3. The default only
+    /// accepts senders on the device itself; anyone who can reach the address
+    /// can set the recorded position.
+    pub gps_nmea_udp_address: String,
     /// UDP port to receive NMEA sentences on when gps_mode=3
     pub gps_nmea_udp_port: u16,
     /// Minimum number of seconds between two recorded NMEA positions
@@ -173,6 +177,7 @@ impl Default for Config {
             gps_mode: GpsMode::Disabled,
             gps_fixed_latitude: None,
             gps_fixed_longitude: None,
+            gps_nmea_udp_address: "127.0.0.1".to_string(),
             gps_nmea_udp_port: 12841,
             gps_nmea_interval_secs: 10,
             wifi_ssid: None,
