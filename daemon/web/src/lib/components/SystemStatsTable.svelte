@@ -48,6 +48,12 @@
                 <td class="py-1 pr-4 text-gray-500 font-medium">Rayhunter Version</td>
                 <td class="py-1">{stats.runtime_metadata.rayhunter_version}</td>
             </tr>
+            {#if stats.runtime_metadata.build_id}
+                <tr class="border-b border-gray-200">
+                    <td class="py-1 pr-4 text-gray-500 font-medium">Build</td>
+                    <td class="py-1 font-mono">{stats.runtime_metadata.build_id}</td>
+                </tr>
+            {/if}
             <tr class="border-b border-gray-200">
                 <td class="py-1 pr-4 text-gray-500 font-medium">Storage</td>
                 <td class="py-1">

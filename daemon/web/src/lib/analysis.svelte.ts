@@ -27,6 +27,7 @@ export class ReportMetadata {
 
 export type RayhunterMetadata = {
     rayhunter_version: string;
+    build_id?: string;
     system_os: string;
     arch: string;
 };
