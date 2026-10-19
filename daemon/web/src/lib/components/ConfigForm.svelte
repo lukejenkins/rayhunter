@@ -664,7 +664,7 @@
                         <FormField
                             id="gps_nmea_udp_address"
                             label="NMEA Listen Address"
-                            help="127.0.0.1 accepts only senders on the device. Anyone who can reach another address can set the recorded position."
+                            help="IP address to listen on (127.0.0.1 by default)"
                         >
                             <input
                                 id="gps_nmea_udp_address"
