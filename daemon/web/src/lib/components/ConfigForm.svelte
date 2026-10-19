@@ -609,6 +609,9 @@
                                 Positions are read from NMEA sentences (GGA or RMC with a fix)
                                 received on the UDP port below, e.g. from the device's own GNSS
                                 receiver.
+                            {:else if gpsMode === GpsMode.Qmiloc}
+                                Positions are read directly from the device's own GNSS receiver
+                                through QMI-LOC. Needs an SDX-class modem such as the Orbic R500L5.
                             {:else}
                                 GPS is disabled; no coordinates will be tracked.
                             {/if}
@@ -622,6 +625,7 @@
                             <option value={GpsMode.Fixed}>Fixed coordinates</option>
                             <option value={GpsMode.Api}>API endpoint</option>
                             <option value={GpsMode.Nmea}>NMEA over UDP</option>
+                            <option value={GpsMode.Qmiloc}>Device GNSS (QMI-LOC)</option>
                         </select>
                     </FormField>
                     {#if config.gps_mode === GpsMode.Fixed}
@@ -689,9 +693,11 @@
                                 class="form-control w-full"
                             />
                         </FormField>
+                    {/if}
+                    {#if config.gps_mode === GpsMode.Nmea || config.gps_mode === GpsMode.Qmiloc}
                         <FormField
                             id="gps_nmea_interval_secs"
-                            label="NMEA Recording Interval (seconds)"
+                            label="Recording Interval (seconds)"
                             help="Minimum time between two recorded positions"
                         >
                             <input

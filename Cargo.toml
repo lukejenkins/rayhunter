@@ -20,4 +20,5 @@ default-members = [
     "telcom-parser",
     "installer",
 ]
+exclude = ["third_party/qmiloc"]
 resolver = "2"

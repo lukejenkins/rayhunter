@@ -352,6 +352,18 @@ async fn run_with_config(
             shutdown_token.clone(),
         );
     }
+    if config.gps_mode == GpsMode::Qmiloc && !config.debug_mode {
+        #[cfg(target_os = "linux")]
+        gps::run_qmiloc_gps_reader(
+            &task_tracker,
+            Duration::from_secs(config.gps_nmea_interval_secs),
+            diag_tx.clone(),
+            gps_state.clone(),
+            shutdown_token.clone(),
+        );
+        #[cfg(not(target_os = "linux"))]
+        warn!("gps_mode is QMI-LOC, which needs Linux; no GPS coordinates will be recorded");
+    }
 
     let state = Arc::new(ServerState {
         config_path: args.config_path.clone(),

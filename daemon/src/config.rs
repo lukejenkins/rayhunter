@@ -17,6 +17,9 @@ pub enum GpsMode {
     /// Positions read from NMEA 0183 sentences received over UDP, e.g. from
     /// the device's own GNSS receiver.
     Nmea = 3,
+    /// Positions read straight from the device's own GNSS engine through
+    /// QMI-LOC over QRTR (SDX-class modems such as the Orbic R500L5).
+    Qmiloc = 4,
 }
 
 #[repr(u8)]
@@ -105,7 +108,8 @@ pub struct Config {
     pub gps_nmea_udp_address: String,
     /// UDP port to receive NMEA sentences on when gps_mode=3
     pub gps_nmea_udp_port: u16,
-    /// Minimum number of seconds between two recorded NMEA positions
+    /// Minimum number of seconds between two recorded positions when
+    /// gps_mode=3 or gps_mode=4
     pub gps_nmea_interval_secs: u64,
     /// Wifi client SSID
     pub wifi_ssid: Option<String>,

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# Vendored crate; see README.md before changing anything here.
+[package]
+name = "qmiloc"
+description = "Blocking QMI-LOC client over QRTR: turn a Qualcomm modem's GNSS engine into NMEA sentences"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[dependencies]
+libc = { version = "0.2", default-features = false }

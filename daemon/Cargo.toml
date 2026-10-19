@@ -53,6 +53,10 @@ async-trait = "0.1.88"
 utoipa = { version = "5.4.0", features = ["repr"], optional = true }
 url = "2.5.4"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Apache-2.0, vendored; see third_party/qmiloc/README.md.
+qmiloc = { path = "../third_party/qmiloc" }
+
 [dev-dependencies]
 reqwest = { version = "0.12.20", default-features = false, features = ["gzip"] }
 tempfile = "3.10.2"

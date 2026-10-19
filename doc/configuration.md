@@ -43,6 +43,8 @@ The modes are:
 
 - *NMEA over UDP*, listens on a UDP address and port (127.0.0.1:12841 by default) for NMEA 0183 sentences, for example from the device's own GNSS receiver. Positions are taken from GGA sentences with a fix and RMC sentences with status `A`; sentences with a missing or wrong checksum are ignored. The sentences are not authenticated, so anyone who can send to the listen address can set the recorded position: keep the default loopback address unless you trust every host that can reach the one you choose. At most one position is recorded per interval (10 seconds by default).
 
+- *Device GNSS (QMI-LOC)*, reads positions directly from the device's own GNSS receiver through the QMI Location service over QRTR, with no separate forwarder. It needs an SDX-class modem that registers that service on QRTR, such as the Orbic R500L5. Positions are taken from the same GGA and RMC sentences as *NMEA over UDP*, and the same recording interval applies. If no sentences arrive for 30 seconds the GNSS session is restarted. The engine's NMEA sentence selection is shared by every client on the device, so this mode requests the usual set (including GGA and RMC) to leave any other location client on the device undisturbed.
+
 The GPS data is stored as a separate JSON file next to QMDL captures, and contains its own timestamps. These timestamps are meant to be compared during analysis with the packet timestamp so we know the time difference between the packet capture from the GPS capture, if there is any, since GPS data and packet data may come from two entirely separate devices.
 
 ## WiFi Client Mode

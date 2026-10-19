@@ -33,6 +33,7 @@ export enum GpsMode {
     Fixed = 1,
     Api = 2,
     Nmea = 3,
+    Qmiloc = 4,
 }
 
 export function gps_mode_label(mode: GpsMode | undefined | null): string {
@@ -43,6 +44,8 @@ export function gps_mode_label(mode: GpsMode | undefined | null): string {
             return 'API endpoint';
         case GpsMode.Nmea:
             return 'NMEA over UDP';
+        case GpsMode.Qmiloc:
+            return 'Device GNSS (QMI-LOC)';
         default:
             return 'Disabled';
     }

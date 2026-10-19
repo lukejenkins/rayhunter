@@ -246,7 +246,7 @@ pub fn run_nmea_gps_listener(
             }
         };
         info!("Listening for NMEA sentences on UDP {address}:{port}");
-        let mut last_recorded: Option<Instant> = None;
+        let mut sink = PositionSink::new(interval, diag_device_sender, gps_state);
         let mut buf = [0u8; 2048];
         loop {
             let len = select! {
@@ -265,20 +265,168 @@ pub fn run_nmea_gps_listener(
             let Some(position) = datagram.lines().rev().find_map(parse_nmea_position) else {
                 continue;
             };
-            if last_recorded.is_some_and(|t| t.elapsed() < interval) {
-                continue;
-            }
-            last_recorded = Some(Instant::now());
-            *gps_state.write().await = Some(position.clone());
-            let update = DiagDeviceCtrlMessage::GpsUpdate {
-                lat: position.latitude,
-                lon: position.longitude,
-            };
-            if diag_device_sender.send(update).await.is_err() {
+            if !sink.offer(position).await {
                 break;
             }
         }
     });
+}
+
+/// Records at most one position per interval, shared by the NMEA sources.
+struct PositionSink {
+    interval: Duration,
+    last_recorded: Option<Instant>,
+    diag_device_sender: Sender<DiagDeviceCtrlMessage>,
+    gps_state: Arc<RwLock<Option<GpsData>>>,
+}
+
+impl PositionSink {
+    fn new(
+        interval: Duration,
+        diag_device_sender: Sender<DiagDeviceCtrlMessage>,
+        gps_state: Arc<RwLock<Option<GpsData>>>,
+    ) -> Self {
+        PositionSink {
+            interval,
+            last_recorded: None,
+            diag_device_sender,
+            gps_state,
+        }
+    }
+
+    /// Returns false once the diag device has gone away.
+    async fn offer(&mut self, position: GpsData) -> bool {
+        if self
+            .last_recorded
+            .is_some_and(|t| t.elapsed() < self.interval)
+        {
+            return true;
+        }
+        self.last_recorded = Some(Instant::now());
+        *self.gps_state.write().await = Some(position.clone());
+        let update = DiagDeviceCtrlMessage::GpsUpdate {
+            lat: position.latitude,
+            lon: position.longitude,
+        };
+        self.diag_device_sender.send(update).await.is_ok()
+    }
+}
+
+/// No NMEA for this long restarts the LOC session.
+#[cfg(target_os = "linux")]
+const QMILOC_IDLE_RESTART: Duration = Duration::from_secs(30);
+/// Wait between attempts to find the LOC service, which registers late after boot.
+#[cfg(target_os = "linux")]
+const QMILOC_RETRY: Duration = Duration::from_secs(10);
+
+/// Reads positions from the modem's own GNSS engine through QMI-LOC over QRTR,
+/// without a separate forwarder or a UDP hop.
+#[cfg(target_os = "linux")]
+pub fn run_qmiloc_gps_reader(
+    task_tracker: &TaskTracker,
+    interval: Duration,
+    diag_device_sender: Sender<DiagDeviceCtrlMessage>,
+    gps_state: Arc<RwLock<Option<GpsData>>>,
+    shutdown_token: CancellationToken,
+) {
+    let (position_tx, mut position_rx) = tokio::sync::mpsc::channel(16);
+    let reader_token = shutdown_token.clone();
+    task_tracker.spawn_blocking(move || read_qmiloc_positions(position_tx, reader_token));
+    task_tracker.spawn(async move {
+        let mut sink = PositionSink::new(interval, diag_device_sender, gps_state);
+        loop {
+            let position = select! {
+                _ = shutdown_token.cancelled() => break,
+                position = position_rx.recv() => match position {
+                    Some(position) => position,
+                    None => break,
+                },
+            };
+            if !sink.offer(position).await {
+                break;
+            }
+        }
+    });
+}
+
+/// Blocking loop: find the LOC service, run a session, and look the service up
+/// again if the socket fails. Returns on shutdown or when nobody is listening.
+#[cfg(target_os = "linux")]
+fn read_qmiloc_positions(position_tx: Sender<GpsData>, shutdown_token: CancellationToken) {
+    while !shutdown_token.is_cancelled() {
+        match qmiloc::Client::lookup(Duration::from_secs(5)) {
+            Ok(loc) => {
+                if !run_qmiloc_session(loc, &position_tx, &shutdown_token) {
+                    return;
+                }
+            }
+            Err(e) => warn!("QMI-LOC GPS: {e}"),
+        }
+        let retry_at = std::time::Instant::now() + QMILOC_RETRY;
+        while !shutdown_token.is_cancelled() && std::time::Instant::now() < retry_at {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+/// Returns false when the position receiver is gone, true when the socket
+/// failed and the service should be looked up again.
+#[cfg(target_os = "linux")]
+fn run_qmiloc_session(
+    mut loc: qmiloc::Client,
+    position_tx: &Sender<GpsData>,
+    shutdown_token: &CancellationToken,
+) -> bool {
+    let s = loc.service();
+    info!(
+        "QMI-LOC GPS: LOC service {} v{} at node {} port {}",
+        s.service, s.version, s.node, s.port
+    );
+    let mut started = false;
+    let mut last_start = std::time::Instant::now();
+    let mut last_nmea = std::time::Instant::now();
+    let mut receiver_alive = true;
+    while receiver_alive && !shutdown_token.is_cancelled() {
+        if !started
+            || (last_nmea.elapsed() > QMILOC_IDLE_RESTART
+                && last_start.elapsed() > QMILOC_IDLE_RESTART)
+        {
+            let registered = loc.register_nmea();
+            // The sentence mask is engine-wide, so this keeps the same mask
+            // as a separate NMEA forwarder would, to leave other LOC clients undisturbed.
+            let types = loc.set_nmea_types(qmiloc::NMEA_TYPES_DEFAULT);
+            let start = loc.start();
+            let message = format!(
+                "QMI-LOC GPS: REG_EVENTS {registered:?}, SET_NMEA_TYPES {types:?}, START {start:?}"
+            );
+            if started {
+                warn!("{message} (no NMEA for {QMILOC_IDLE_RESTART:?}, restarted)");
+            } else {
+                info!("{message}");
+            }
+            started = true;
+            last_start = std::time::Instant::now();
+        }
+        match loc.next_nmea(Duration::from_secs(1)) {
+            Ok(Some(text)) => {
+                last_nmea = std::time::Instant::now();
+                let position = qmiloc::sentences(&text)
+                    .filter_map(|s| std::str::from_utf8(s).ok())
+                    .filter_map(parse_nmea_position)
+                    .last();
+                if let Some(position) = position {
+                    receiver_alive = position_tx.blocking_send(position).is_ok();
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                error!("QMI-LOC GPS: receive failed: {e}");
+                break;
+            }
+        }
+    }
+    info!("QMI-LOC GPS: STOP {:?}", loc.stop());
+    receiver_alive
 }
 
 #[cfg(test)]
@@ -332,5 +480,44 @@ mod tests {
         assert!(parse_nmea_position("$GPGSV,3,1,11,03,03,111,00,04,15,270,00*7F").is_none());
         assert!(parse_nmea_position("$PQWP1,0,0*37").is_none());
         assert!(parse_nmea_position("not nmea").is_none());
+    }
+
+    #[test]
+    fn qmiloc_is_gps_mode_4() {
+        assert_eq!(
+            serde_json::from_str::<GpsMode>("4").unwrap(),
+            GpsMode::Qmiloc
+        );
+        assert_eq!(serde_json::to_string(&GpsMode::Qmiloc).unwrap(), "4");
+    }
+
+    fn position(latitude: f64) -> GpsData {
+        GpsData {
+            latitude,
+            longitude: 0.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sink_records_one_position_per_interval() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = Arc::new(RwLock::new(None));
+        let mut sink = PositionSink::new(Duration::from_secs(3600), tx, state.clone());
+        assert!(sink.offer(position(1.0)).await);
+        assert!(sink.offer(position(2.0)).await);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DiagDeviceCtrlMessage::GpsUpdate { lat, .. }) if lat == 1.0
+        ));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.read().await.as_ref().unwrap().latitude, 1.0);
+    }
+
+    #[tokio::test]
+    async fn the_sink_reports_a_closed_diag_device() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        drop(rx);
+        let mut sink = PositionSink::new(Duration::ZERO, tx, Arc::new(RwLock::new(None)));
+        assert!(!sink.offer(position(1.0)).await);
     }
 }
