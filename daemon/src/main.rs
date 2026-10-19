@@ -18,6 +18,7 @@ mod webdav;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::battery::run_battery_notification_worker;
 use crate::config::{GpsMode, parse_args, parse_config};
@@ -339,6 +340,17 @@ async fn run_with_config(
     } else {
         None
     };
+    let gps_state = Arc::new(RwLock::new(initial_gps));
+    if config.gps_mode == GpsMode::Nmea && !config.debug_mode {
+        gps::run_nmea_gps_listener(
+            &task_tracker,
+            config.gps_nmea_udp_port,
+            Duration::from_secs(config.gps_nmea_interval_secs),
+            diag_tx.clone(),
+            gps_state.clone(),
+            shutdown_token.clone(),
+        );
+    }
 
     let state = Arc::new(ServerState {
         config_path: args.config_path.clone(),
@@ -351,7 +363,7 @@ async fn run_with_config(
         ui_update_sender: Some(ui_update_tx),
         wifi_status,
         wifi_scan_lock: tokio::sync::Mutex::new(()),
-        gps_state: Arc::new(tokio::sync::RwLock::new(initial_gps)),
+        gps_state,
         update_status_lock: update_status_lock.clone(),
     });
     run_server(&task_tracker, state, shutdown_token.clone()).await;

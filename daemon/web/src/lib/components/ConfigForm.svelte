@@ -605,6 +605,10 @@
                                 the network. Timestamp is derived from packet capture timing.
                             {:else if gpsMode === GpsMode.Fixed}
                                 GPS coordinates are fixed to the values below.
+                            {:else if gpsMode === GpsMode.Nmea}
+                                Positions are read from NMEA sentences (GGA or RMC with a fix)
+                                received on the UDP port below, e.g. from the device's own GNSS
+                                receiver.
                             {:else}
                                 GPS is disabled; no coordinates will be tracked.
                             {/if}
@@ -617,6 +621,7 @@
                             <option value={GpsMode.Disabled}>Disabled</option>
                             <option value={GpsMode.Fixed}>Fixed coordinates</option>
                             <option value={GpsMode.Api}>API endpoint</option>
+                            <option value={GpsMode.Nmea}>NMEA over UDP</option>
                         </select>
                     </FormField>
                     {#if config.gps_mode === GpsMode.Fixed}
@@ -651,6 +656,37 @@
                                 required
                                 bind:value={config.gps_fixed_longitude}
                                 placeholder="e.g. -122.4194"
+                                class="form-control w-full"
+                            />
+                        </FormField>
+                    {/if}
+                    {#if config.gps_mode === GpsMode.Nmea}
+                        <FormField
+                            id="gps_nmea_udp_port"
+                            label="NMEA UDP Port"
+                            help="UDP port the NMEA sentences arrive on"
+                        >
+                            <input
+                                id="gps_nmea_udp_port"
+                                type="number"
+                                min="1"
+                                max="65535"
+                                required
+                                bind:value={config.gps_nmea_udp_port}
+                                class="form-control w-full"
+                            />
+                        </FormField>
+                        <FormField
+                            id="gps_nmea_interval_secs"
+                            label="NMEA Recording Interval (seconds)"
+                            help="Minimum time between two recorded positions"
+                        >
+                            <input
+                                id="gps_nmea_interval_secs"
+                                type="number"
+                                min="0"
+                                required
+                                bind:value={config.gps_nmea_interval_secs}
                                 class="form-control w-full"
                             />
                         </FormField>

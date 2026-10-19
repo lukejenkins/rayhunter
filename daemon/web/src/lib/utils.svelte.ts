@@ -32,6 +32,7 @@ export enum GpsMode {
     Disabled = 0,
     Fixed = 1,
     Api = 2,
+    Nmea = 3,
 }
 
 export function gps_mode_label(mode: GpsMode | undefined | null): string {
@@ -40,6 +41,8 @@ export function gps_mode_label(mode: GpsMode | undefined | null): string {
             return 'Fixed coordinates';
         case GpsMode.Api:
             return 'API endpoint';
+        case GpsMode.Nmea:
+            return 'NMEA over UDP';
         default:
             return 'Disabled';
     }
@@ -74,6 +77,8 @@ export interface Config {
     gps_mode: GpsMode;
     gps_fixed_latitude: number | null;
     gps_fixed_longitude: number | null;
+    gps_nmea_udp_port: number;
+    gps_nmea_interval_secs: number;
 }
 
 export interface WifiStatus {
