@@ -13,9 +13,9 @@ it took to get it recording, analyzing and tagging recordings with the device's 
 |---|---|
 | ![Rayhunter web UI on an Orbic R500L5](doc/orbic-r500l5/r500l5-home.png) | ![Green Rayhunter status line across the top of the R500L5's stock screen](doc/orbic-r500l5/r500l5-lcd-recording.png) |
 
-![System Information: build, storage on /cache, battery, GPS mode Device GNSS (QMI-LOC)](doc/orbic-r500l5/r500l5-system-information.png)
+![System Information: build, storage on /cache, battery, GPS mode Device GNSS (QMI-LOC) with a fix (latitude and longitude blacked out)](doc/orbic-r500l5/r500l5-system-information.png)
 
-*Storage is the `/cache` volume. The unit was indoors without sky view, so the GPS row is waiting for a fix.*
+*Storage is the `/cache` volume. The GNSS has a fix; the latitude and longitude are blacked out.*
 
 ## What works
 
