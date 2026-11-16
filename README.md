@@ -7,7 +7,7 @@
 
 This branch (`m2100-support`) runs Rayhunter on the M2100: it captures and analyses live LTE traffic and alerts on detections. The story of the port, including what we found, what we verified and where we stopped, is in the write-up: **[Rayhunter on the Inseego M2100: field notes from a port](https://tpc.institute/projects/rayhunter-m2100)**.
 
-It is a proof of concept for one household: one sentinel unit on a shelf, reporting to Home Assistant. What changed between releases is in [CHANGELOG.md](CHANGELOG.md).
+It is a proof of concept meant for a household: one sentinel unit on a shelf, reporting to Home Assistant. What changed between releases is in [CHANGELOG.md](CHANGELOG.md).
 
 ### What's here
 
