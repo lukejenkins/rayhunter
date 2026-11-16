@@ -49,6 +49,7 @@ pub struct ServerState {
     pub wifi_status: Arc<RwLock<wifi_station::WifiStatus>>,
     pub wifi_scan_lock: tokio::sync::Mutex<()>,
     pub gps_state: Arc<RwLock<Option<GpsData>>>,
+    pub live: Arc<std::sync::Mutex<crate::m2100_observe::LiveObservations>>,
     pub update_status_lock: Arc<RwLock<UpdateStatus>>,
 }
 
@@ -556,6 +557,149 @@ pub async fn debug_set_display_state(
     }
 }
 
+/// The saved deployment profile and live readings (M2100). Read-only: the
+/// profile is switched from the panel, never over the network.
+pub async fn get_m2100_profile() -> Json<crate::display::m2100_profile_io::Readings> {
+    let runner = crate::display::m2100_cli::System::new();
+    Json(crate::display::m2100_profile_io::readings(&runner, std::path::Path::new("/")).await)
+}
+
+/// Which profile each capture was recorded in (`{"<capture>": "fixed" |
+/// "mobile" | "mixed"}`). A missing log is an empty object.
+pub async fn get_m2100_capture_profiles() -> Json<std::collections::BTreeMap<String, &'static str>>
+{
+    let text =
+        tokio::fs::read_to_string(crate::display::m2100_capture_profiles::CAPTURE_PROFILES_PATH)
+            .await
+            .unwrap_or_default();
+    Json(crate::display::m2100_capture_profiles::summarise(&text))
+}
+
+/// The only write endpoint for the archive add-on: moves the unit to its
+/// locked-down Fixed profile and nothing else. Takes no parameters. A missing,
+/// wrong or absent token is the same empty 401; one accepted request per 10 s.
+pub async fn post_m2100_fixed(headers: axum::http::HeaderMap) -> Response {
+    use crate::display::m2100_token::{RATE_LIMIT, TOKEN_PATH, bearer_ok};
+    let stored = tokio::fs::read_to_string(TOKEN_PATH).await.ok();
+    let given = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if !bearer_ok(given, stored.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !RATE_LIMIT.allow(std::time::Instant::now()) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    use crate::display::m2100_profile_io::{BOOT_FAILED, SWITCHING};
+    // Detached: if the client hangs up, the switch still runs to the end rather
+    // than being cancelled with Fixed half-applied.
+    let ok = crate::display::m2100_token::guarded_detached(&SWITCHING, async {
+        crate::display::m2100_profile_io::switch_to(
+            &crate::display::m2100_cli::System::new(),
+            std::path::Path::new(crate::display::m2100_profile::PROFILE_PATH),
+            crate::display::m2100_profile::Profile::Fixed,
+        )
+        .await
+    })
+    .await;
+    if ok {
+        BOOT_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    Json(serde_json::json!({ "ok": ok })).into_response()
+}
+
+/// What the current recording has seen so far (towers, identity requests,
+/// warnings) for the archive add-on. Read-only, behind the same device token as
+/// `/fixed` but not rate limited: it is polled. Only the live lock is taken, and
+/// never across an await; the recorder's store lock is not touched.
+#[cfg_attr(feature = "apidocs", utoipa::path(
+    get,
+    path = "/api/m2100/live",
+    tag = "M2100",
+    responses(
+        (status = StatusCode::OK, description = "What the current recording has seen", body = crate::m2100_observe::LiveSnapshot),
+        (status = StatusCode::UNAUTHORIZED, description = "Missing or wrong device token")
+    ),
+    summary = "Live observations (M2100)",
+    description = "Towers, identity requests and warnings seen in the current recording. Requires `Authorization: Bearer <device token>`; not rate limited."
+))]
+pub async fn get_m2100_live(
+    State(state): State<Arc<ServerState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<crate::m2100_observe::LiveSnapshot>, (StatusCode, String)> {
+    let stored = tokio::fs::read_to_string(crate::display::m2100_token::TOKEN_PATH)
+        .await
+        .ok();
+    live_with_token(&state, &headers, stored.as_deref())
+}
+
+fn live_with_token(
+    state: &ServerState,
+    headers: &axum::http::HeaderMap,
+    stored: Option<&str>,
+) -> Result<Json<crate::m2100_observe::LiveSnapshot>, (StatusCode, String)> {
+    let given = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if !crate::display::m2100_token::bearer_ok(given, stored) {
+        return Err((StatusCode::UNAUTHORIZED, String::new()));
+    }
+    let snapshot = state
+        .live
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .snapshot();
+    Ok(Json(snapshot))
+}
+
+/// SHA-256 (lowercase hex) of exactly the bytes `GET /api/qmdl/{name}` streams,
+/// so the archive add-on can verify its copy before deleting the device's.
+/// 404 unknown, 409 for the recording in progress, 500 on any read error.
+pub async fn get_m2100_sha256(
+    State(state): State<Arc<ServerState>>,
+    Path(qmdl_name): Path<String>,
+) -> Result<String, (StatusCode, String)> {
+    let qmdl_idx = qmdl_name.trim_end_matches(".qmdl");
+    // The store guard is held only to find the entry, refuse the current one and
+    // open the file. It is dropped before hashing: the recorder takes the write lock
+    // for every diag container, so holding the read lock for a whole hash would stall
+    // live recording. The open handle keeps reading the right file regardless.
+    let qmdl_file = {
+        let qmdl_store = state.qmdl_store_lock.read().await;
+        let (entry_index, _) = qmdl_store.entry_for_name(qmdl_idx).ok_or((
+            StatusCode::NOT_FOUND,
+            format!("couldn't find qmdl file with name {qmdl_idx}"),
+        ))?;
+        if qmdl_store.current_entry == Some(entry_index) {
+            return Err((StatusCode::CONFLICT, "recording in progress".to_string()));
+        }
+        qmdl_store
+            .open_file(entry_index, FileKind::Qmdl)
+            .await
+            .map_err(|err| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("error opening QMDL file: {err}"),
+                )
+            })?
+            .ok_or((StatusCode::NOT_FOUND, "QMDL file not found".to_string()))?
+    };
+    let qmdl_reader = QmdlMessageReader::new(qmdl_file).await.map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("error reading QMDL file: {err}"),
+        )
+    })?;
+    crate::display::m2100_hash::sha256_of_stream(qmdl_reader.into_qmdl_stream().into_stream())
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("error hashing QMDL file: {err}"),
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -634,6 +778,7 @@ mod tests {
             wifi_status: Arc::new(RwLock::new(wifi_station::WifiStatus::default())),
             wifi_scan_lock: tokio::sync::Mutex::new(()),
             gps_state: Arc::new(RwLock::new(None)),
+            live: Arc::default(),
             update_status_lock: Arc::new(RwLock::new(UpdateStatus::default())),
         })
     }
@@ -704,5 +849,175 @@ mod tests {
             qmdl_reader.get_next_message().await.unwrap(),
             Some(Ok(expected_message)),
         );
+    }
+
+    /// I3: the hash must not hold the store's read lock while it reads the file,
+    /// or the recorder (which takes the write lock per diag container) stalls.
+    /// The QMDL file is swapped for a FIFO that has a writer but no data yet, so
+    /// the hash blocks in its first read; the write lock must still be free.
+    #[tokio::test]
+    async fn sha256_does_not_hold_the_store_lock_while_hashing() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_temp_dir, store_lock) = create_test_qmdl_store().await;
+        let entry_name = create_test_entry_with_data(&store_lock, &create_test_container()).await;
+        let qmdl_path = {
+            let store = store_lock.read().await;
+            let (i, _) = store.entry_for_name(&entry_name).unwrap();
+            store.manifest.entries[i].get_filepath(FileKind::Qmdl, &store.path)
+        };
+        std::fs::remove_file(&qmdl_path).unwrap();
+        let c = std::ffi::CString::new(qmdl_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        // O_RDWR on a FIFO opens without waiting and keeps a writer present.
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&qmdl_path)
+            .unwrap();
+        let state = create_test_server_state(store_lock.clone());
+        let hashing = tokio::spawn(get_m2100_sha256(State(state), Path(entry_name)));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let got_write =
+            tokio::time::timeout(std::time::Duration::from_secs(2), store_lock.write()).await;
+        let free = got_write.is_ok();
+        drop(got_write);
+        // Let the hash finish whatever the outcome, so no blocking read is left behind.
+        use std::io::Write;
+        writer.write_all(b"\x10\x00").unwrap();
+        drop(writer);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), hashing).await;
+        assert!(free, "the store lock was held while hashing");
+    }
+
+    const LIVE_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn bearer(token: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        h
+    }
+
+    async fn live_state() -> (TempDir, Arc<ServerState>) {
+        let (dir, store_lock) = create_test_qmdl_store().await;
+        (dir, create_test_server_state(store_lock))
+    }
+
+    async fn body_json(r: Json<crate::m2100_observe::LiveSnapshot>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(Json(r.0).into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn live_without_header_is_401() {
+        let (_d, state) = live_state().await;
+        let r = live_with_token(&state, &axum::http::HeaderMap::new(), Some(LIVE_TOKEN));
+        assert_eq!(r.err().unwrap().0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn live_with_wrong_token_is_401() {
+        let (_d, state) = live_state().await;
+        let wrong = "f".repeat(64);
+        let r = live_with_token(&state, &bearer(&wrong), Some(LIVE_TOKEN));
+        assert_eq!(r.err().unwrap().0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn live_without_token_file_matches_fixed_handler() {
+        let (_d, state) = live_state().await;
+        // No stored token: refused, with the status the /fixed handler gives.
+        let r = live_with_token(&state, &bearer(LIVE_TOKEN), None);
+        let live_status = r.err().unwrap().0;
+        let fixed = post_m2100_fixed(bearer(LIVE_TOKEN)).await.status();
+        assert_eq!(live_status, fixed);
+        assert_eq!(live_status, StatusCode::UNAUTHORIZED);
+        // The real handler, on a box with no token file, agrees.
+        if !std::path::Path::new(crate::display::m2100_token::TOKEN_PATH).exists() {
+            let r = get_m2100_live(State(state), bearer(LIVE_TOKEN)).await;
+            assert_eq!(r.err().unwrap().0, fixed);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_when_idle_is_empty_200() {
+        let (_d, state) = live_state().await;
+        let r = live_with_token(&state, &bearer(LIVE_TOKEN), Some(LIVE_TOKEN)).unwrap();
+        let v = body_json(r).await;
+        assert_eq!(v["version"], 1);
+        assert!(v["recording"].is_null());
+        assert_eq!(v["towers"], serde_json::json!([]));
+        assert_eq!(v["identity"], serde_json::json!([]));
+        assert_eq!(v["warnings"], serde_json::json!([]));
+        assert_eq!(v["towers_capped"], false);
+        assert_eq!(v["identity_total"], 0);
+        assert_eq!(v["warnings_total"], 0);
+        assert_eq!(v["warnings_high_total"], 0);
+    }
+
+    #[tokio::test]
+    async fn live_returns_snapshot() {
+        use rayhunter::analysis::analyzer::{Event, EventType};
+        use rayhunter::analysis::observe::Sib1Tower;
+        let (_d, state) = live_state().await;
+        {
+            let mut live = state.live.lock().unwrap();
+            live.reset(Some("1700000000".to_string()));
+            let sib1 = Sib1Tower {
+                plmn: Some("311-480".to_string()),
+                tac: 7,
+                cell: 99,
+            };
+            live.observe_parts(None, Some((270, 1811)), Some(sib1), true);
+            live.warning(
+                None,
+                "IMSI Requested",
+                &Event {
+                    event_type: EventType::High,
+                    message: "boom".to_string(),
+                },
+            );
+        }
+        let r = live_with_token(&state, &bearer(LIVE_TOKEN), Some(LIVE_TOKEN)).unwrap();
+        let v = body_json(r).await;
+        assert_eq!(v["recording"], "1700000000");
+        assert_eq!(v["towers"][0]["plmn"], "311-480");
+        assert_eq!(v["towers"][0]["tac"], 7);
+        assert_eq!(v["towers"][0]["cell"], 99);
+        assert_eq!(v["towers"][0]["pci"], 270);
+        assert_eq!(v["towers"][0]["earfcn"], 1811);
+        assert_eq!(v["towers"][0]["hits"], 1);
+        assert_eq!(v["identity_total"], 1);
+        assert_eq!(v["identity"].as_array().unwrap().len(), 1);
+        assert_eq!(v["warnings"][0]["severity"], "high");
+        assert_eq!(v["warnings"][0]["analyzer"], "IMSI Requested");
+        assert_eq!(v["warnings"][0]["msg"], "boom");
+        assert_eq!(v["warnings_total"], 1);
+        assert_eq!(v["warnings_high_total"], 1);
+    }
+
+    #[tokio::test]
+    async fn live_is_not_rate_limited() {
+        let (_d, state) = live_state().await;
+        for _ in 0..3 {
+            assert!(live_with_token(&state, &bearer(LIVE_TOKEN), Some(LIVE_TOKEN)).is_ok());
+        }
+    }
+
+    #[test]
+    fn live_handler_takes_only_the_live_lock_and_no_rate_limit() {
+        let server = include_str!("server.rs");
+        let start = server.find("fn live_with_token").unwrap();
+        let end = server[start..].find("\n}\n").unwrap();
+        let body = &server[start..start + end];
+        let handler_start = server.find("pub async fn get_m2100_live").unwrap();
+        let handler =
+            &server[handler_start..handler_start + server[handler_start..].find("\n}\n").unwrap()];
+        let body = format!("{handler}{body}");
+        assert!(!body.contains("qmdl_store_lock") && !body.contains("RATE_LIMIT"));
     }
 }

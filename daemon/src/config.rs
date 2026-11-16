@@ -25,6 +25,10 @@ pub enum UiLevel {
     Demo = 2,
     EffLogo = 3,
     HighVisibility = 4,
+    /// Live status panel: serving cell, signal, carrier, data use and
+    /// Rayhunter's own state. Currently only the M2100 renders this; other
+    /// devices fall through to the plain status bar.
+    LiveStatus = 5,
     TransFlag = 128,
 }
 

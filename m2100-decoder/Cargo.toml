@@ -1,0 +1,36 @@
+[package]
+name = "m2100-decoder"
+version = "0.1.0"
+edition = "2024"
+description = "Sandboxed (wasm32-wasip1) decoder: one gzipped QMDL capture on stdin -> JSON-line events on stdout"
+
+[dependencies]
+rayhunter = { path = "../lib" }
+# Exactly the source string lib/Cargo.toml uses (a `rev` would make it a
+# different crate); Cargo.lock (copied from the device workspace) pins the
+# commit, so these NAS types are the ones rayhunter's InformationElement holds.
+pycrate-rs = { git = "https://github.com/EFForg/pycrate-rs" }
+chrono = "0.4"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["rt"] }
+
+[dev-dependencies]
+deku = "0.20"
+tempfile = "3"
+
+# Hostile-input tests push ~1 GiB through gunzip; unoptimised that takes minutes.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# Standalone project: not a member of the device workspace.
+[workspace]

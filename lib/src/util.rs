@@ -32,7 +32,7 @@ impl RuntimeMetadata {
             system_os: std::env::consts::OS.to_string(),
         };
 
-        #[cfg(target_family = "windows")]
+        #[cfg(not(target_family = "unix"))]
         return build_target;
 
         #[cfg(target_family = "unix")]

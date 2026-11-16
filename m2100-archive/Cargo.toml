@@ -1,0 +1,58 @@
+[package]
+name = "m2100-archive"
+version = "0.8.4"
+edition = "2024"
+
+[dependencies]
+regex = "1"
+anyhow = "1"
+async-trait = "0.1"
+flate2 = "1"
+futures-util = "0.3"
+log = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "time", "sync", "net"] }
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls-no-provider"] }
+nix = { version = "0.31.3", default-features = false, features = ["fs"] }
+env_logger = "0.11.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+# The decoder sandbox (src/sandbox.rs). Pinned: the compiled-module cache and the
+# shadowed poll_oneoff depend on this exact line's behaviour.
+wasmtime = { version = "=49.0.2", default-features = false, features = ["cranelift", "runtime", "std", "anyhow"] }
+wasmtime-wasi = { version = "=49.0.2", default-features = false, features = ["p1"] }
+# Same major as wasmtime-wasi's rand, for the zero-filled RNG.
+rand_core = "0.10"
+bytes = "1"
+# Meshtastic radio on a serial port. No libudev: the release build is static musl.
+serialport = { version = "4", default-features = false }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+
+[build-dependencies]
+sha2 = "0.10"
+
+[dev-dependencies]
+glob = "0.3.4"
+mockito = "1"
+serde_yaml = "0.9.34"
+tempfile = "3"
+wat = "1"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["test-util"] }
+
+[profile.release]
+# wasmtime adds ~13.5 MB of symbols to the binary.
+strip = true
+
+# Standalone project: not a member of the device workspace.
+[workspace]
+
+# The tests run the wasm guest; wasmtime/cranelift unoptimised take a minute to compile it.
+[profile.dev.package."*"]
+opt-level = 3

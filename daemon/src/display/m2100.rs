@@ -107,6 +107,59 @@ async fn write_buzzer(file: &str, value: &str) {
     }
 }
 
+/// Play (sounding, ms) steps if the user has the buzzer enabled. Enrolment
+/// feedback. Reads the setting's file, not `BUZZER_ON`: that flag is only loaded
+/// on the invisible-UI path, so in LiveStatus it would always read "off".
+pub async fn play_chirps(steps: &[(bool, u64)]) {
+    if !buzzer_enabled() {
+        return;
+    }
+    for (on, ms) in steps {
+        // 4.2 kHz: the middle of the transducer's measured resonance band.
+        buzzer(*on, "238095").await;
+        tokio::time::sleep(Duration::from_millis(*ms)).await;
+    }
+    buzzer(false, "0").await;
+}
+
+/// Whether the buzzer is on. The file is the setting, shared by every display
+/// mode: the double-tap toggle here and the settings row in LiveStatus.
+pub fn buzzer_enabled() -> bool {
+    std::path::Path::new(BUZZER_FLAG).exists()
+}
+
+/// Turn the buzzer on or off, persisted so it survives a restart. Turning it on
+/// confirms with one short chirp; turning it off is silent by definition.
+pub async fn set_buzzer_enabled(on: bool) {
+    BUZZER_ON.store(on, Ordering::Relaxed);
+    if on {
+        let _ = tokio::fs::write(BUZZER_FLAG, b"1").await;
+        info!("buzzer enabled");
+        buzzer(true, "238095").await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        buzzer(false, "0").await;
+    } else {
+        let _ = tokio::fs::remove_file(BUZZER_FLAG).await;
+        info!("buzzer disabled");
+    }
+}
+
+/// Three short pulses at the severity's pitch, for a new detection in
+/// LiveStatus, if the buzzer is on. Rhythm carries through a bag better than
+/// pitch does; the pitch still says how serious (see `buzzer_period_ns`).
+pub async fn play_alert(event_type: EventType) {
+    if !buzzer_enabled() {
+        return;
+    }
+    let period = buzzer_period_ns(event_type);
+    for _ in 0..3 {
+        buzzer(true, period).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        buzzer(false, "0").await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+}
+
 async fn buzzer(on: bool, period_ns: &str) {
     if on {
         write_buzzer("period", period_ns).await;
@@ -124,12 +177,9 @@ fn pattern_for(state: &DisplayState) -> Vec<(bool, u64)> {
     match state {
         DisplayState::Paused => vec![(false, 1000)],
         DisplayState::Recording => vec![(true, 60), (false, 3000)],
-        DisplayState::WarningDetected { .. } => vec![
-            (true, 120),
-            (false, 140),
-            (true, 120),
-            (false, 1200),
-        ],
+        DisplayState::WarningDetected { .. } => {
+            vec![(true, 120), (false, 140), (true, 120), (false, 1200)]
+        }
     }
 }
 
@@ -178,19 +228,10 @@ fn spawn_buzzer_toggle(task_tracker: &TaskTracker, shutdown_token: CancellationT
             if let Some(prev) = last_keyup {
                 let gap = now.duration_since(prev);
                 if gap >= Duration::from_millis(100) && gap <= Duration::from_millis(800) {
-                    let enabled = !BUZZER_ON.fetch_xor(true, Ordering::Relaxed);
-                    if enabled {
-                        let _ = tokio::fs::write(BUZZER_FLAG, b"1").await;
-                        info!("buzzer enabled (double tap)");
-                        // One short chirp confirms it; turning it off is silent
-                        // by definition, so the LED is the only feedback there.
-                        buzzer(true, "238095").await;
-                        tokio::time::sleep(Duration::from_millis(120)).await;
-                        buzzer(false, "0").await;
-                    } else {
-                        let _ = tokio::fs::remove_file(BUZZER_FLAG).await;
-                        info!("buzzer disabled (double tap)");
-                    }
+                    // Turning it off is silent by definition, so the LED is the
+                    // only feedback there.
+                    info!("buzzer toggled (double tap)");
+                    set_buzzer_enabled(!BUZZER_ON.load(Ordering::Relaxed)).await;
                     last_keyup = None;
                     continue;
                 }

@@ -127,6 +127,7 @@ where
     T: AsyncRead,
 {
     buf_reader: BufReader<QmdlAsyncReader<T>>,
+    max_frame: Option<usize>,
 }
 
 async fn is_gzip_stream<T>(mut reader: T) -> std::io::Result<bool>
@@ -148,7 +149,20 @@ where
         let compressed = is_gzip_stream(&mut reader).await.unwrap_or(false);
         Ok(QmdlMessageReader {
             buf_reader: BufReader::new(QmdlAsyncReader::new(reader, compressed)),
+            max_frame: None,
         })
+    }
+
+    /// Bound the size of a single frame (bytes up to and including the
+    /// terminator) read by `get_next_message` (and so `into_message_stream`).
+    /// A frame that reaches `max` bytes without a terminator makes
+    /// `get_next_message` return an `InvalidData` error, having buffered at
+    /// most `max` bytes. Unset (the default) is unbounded, as before.
+    /// This does not affect `into_qmdl_stream`, which the device's download
+    /// endpoint serves.
+    pub fn with_max_frame(mut self, max: usize) -> Self {
+        self.max_frame = Some(max);
+        self
     }
 
     pub fn is_compressed(&self) -> bool {
@@ -188,15 +202,48 @@ where
         &mut self,
     ) -> Result<Option<Result<Message, DiagParsingError>>, std::io::Error> {
         let mut buf = vec![];
-        if self
-            .buf_reader
-            .read_until(MESSAGE_TERMINATOR, &mut buf)
-            .await?
-            == 0
-        {
+        let Some(max) = self.max_frame else {
+            if self
+                .buf_reader
+                .read_until(MESSAGE_TERMINATOR, &mut buf)
+                .await?
+                == 0
+            {
+                return Ok(None);
+            }
+            return Ok(Some(Message::from_hdlc(&buf)));
+        };
+
+        // bounded read: never hold more than `max` bytes of one frame
+        loop {
+            let avail = self.buf_reader.fill_buf().await?;
+            if avail.is_empty() {
+                break;
+            }
+            let room = max - buf.len();
+            if room == 0 {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "frame exceeds limit",
+                ));
+            }
+            let chunk = &avail[..avail.len().min(room)];
+            match chunk.iter().position(|b| *b == MESSAGE_TERMINATOR) {
+                Some(i) => {
+                    buf.extend_from_slice(&chunk[..=i]);
+                    self.buf_reader.consume(i + 1);
+                    break;
+                }
+                None => {
+                    let n = chunk.len();
+                    buf.extend_from_slice(chunk);
+                    self.buf_reader.consume(n);
+                }
+            }
+        }
+        if buf.is_empty() {
             return Ok(None);
         }
-
         Ok(Some(Message::from_hdlc(&buf)))
     }
 }
@@ -389,5 +436,106 @@ mod test {
     async fn test_compressed_reading_and_writing() {
         run_compressed_reading_and_writing_tests(true).await;
         run_compressed_reading_and_writing_tests(false).await;
+    }
+
+    /// An AsyncRead of `len` bytes of 0x41 (never a terminator) that counts
+    /// how many bytes have been pulled out of it.
+    struct CountingReader {
+        remaining: usize,
+        pulled: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncRead for CountingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let n = self.remaining.min(buf.remaining());
+            buf.put_slice(&vec![0x41; n]);
+            self.remaining -= n;
+            self.pulled
+                .fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncSeek for CountingReader {
+        fn start_seek(self: Pin<&mut Self>, _: std::io::SeekFrom) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn poll_complete(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<std::io::Result<u64>> {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_max_frame_bounds_memory() {
+        let pulled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let src = CountingReader {
+            remaining: 1 << 20,
+            pulled: pulled.clone(),
+        };
+        let mut reader = QmdlMessageReader::new(src)
+            .await
+            .unwrap()
+            .with_max_frame(16);
+        let err = reader.get_next_message().await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("frame exceeds limit"));
+        // the BufReader's own buffer (8 KiB) is the most that may be read ahead
+        let p = pulled.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(p <= 16 * 1024, "pulled {p} bytes before erroring");
+    }
+
+    #[tokio::test]
+    async fn test_max_frame_allows_frames_within_limit() {
+        let bytes = get_test_message_bytes();
+        let longest = bytes
+            .split_inclusive(|b| *b == MESSAGE_TERMINATOR)
+            .map(|f| f.len())
+            .max()
+            .unwrap();
+        let mut buf = Cursor::new(bytes);
+        let mut reader = QmdlMessageReader::new(&mut buf)
+            .await
+            .unwrap()
+            .with_max_frame(longest);
+        let (_, expected) = get_test_messages();
+        for msg in expected {
+            assert_eq!(Ok(msg), reader.get_next_message().await.unwrap().unwrap());
+        }
+        assert!(reader.get_next_message().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_max_frame_one_too_small_errors() {
+        let bytes = get_test_message_bytes();
+        let longest = bytes
+            .split_inclusive(|b| *b == MESSAGE_TERMINATOR)
+            .map(|f| f.len())
+            .max()
+            .unwrap();
+        let mut buf = Cursor::new(bytes);
+        let mut reader = QmdlMessageReader::new(&mut buf)
+            .await
+            .unwrap()
+            .with_max_frame(longest - 1);
+        let mut saw_err = false;
+        loop {
+            match reader.get_next_message().await {
+                Err(e) => {
+                    assert_eq!(e.kind(), ErrorKind::InvalidData);
+                    saw_err = true;
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(_)) => {}
+            }
+        }
+        assert!(saw_err);
     }
 }

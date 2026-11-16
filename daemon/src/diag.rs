@@ -1,6 +1,6 @@
 use std::ops::DerefMut;
 use std::pin::pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -31,6 +31,7 @@ use rayhunter::qmdl::QmdlWriter;
 use crate::analysis::{AnalysisCtrlMessage, AnalysisWriter};
 use crate::config::GpsMode;
 use crate::display;
+use crate::m2100_observe::LiveObservations;
 use crate::notifications::{Notification, NotificationType};
 use crate::qmdl_store::{FileKind, RecordingStore, RecordingStoreError};
 use crate::server::ServerState;
@@ -72,6 +73,7 @@ pub struct DiagTask {
     bytes_since_space_check: usize,
     low_space_warned: bool,
     latest_packet_timestamp: Option<i64>,
+    live: Arc<Mutex<LiveObservations>>,
 }
 
 enum DiagState {
@@ -120,6 +122,7 @@ impl DiagTask {
         min_space_to_continue_mb: u64,
         gps_mode: GpsMode,
         gps_fixed_coords: Option<(f64, f64)>,
+        live: Arc<Mutex<LiveObservations>>,
     ) -> Self {
         Self {
             ui_update_sender,
@@ -136,6 +139,7 @@ impl DiagTask {
             bytes_since_space_check: 0,
             low_space_warned: false,
             latest_packet_timestamp: None,
+            live,
         }
     }
 
@@ -190,6 +194,11 @@ impl DiagTask {
                 .map_err(RecordingStoreError::WriteFileError)?;
         }
         self.stop_current_recording(qmdl_store).await;
+        if matches!(self.device, Device::M2100) {
+            crate::display::m2100_capture_profiles::note_started(
+                qmdl_store.get_current_entry().map(|(_, e)| e.name.as_str()),
+            );
+        }
         let qmdl_writer = Box::new(QmdlWriter::new(qmdl_gz_file));
         let device_metadata = DeviceMetadata {
             home_plmn: rayhunter::sim::home_plmn(&self.device).await,
@@ -197,7 +206,12 @@ impl DiagTask {
         let analysis_writer =
             AnalysisWriter::new(analysis_file, &self.analyzer_config, &device_metadata)
                 .await
-                .map_err(RecordingStoreError::WriteFileError)?;
+                .map_err(RecordingStoreError::WriteFileError)?
+                .with_live(self.live.clone());
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset(qmdl_store.get_current_entry().map(|(_, e)| e.name.clone()));
         self.state = DiagState::Recording {
             qmdl_writer,
             analysis_writer: Box::new(analysis_writer),
@@ -303,6 +317,11 @@ impl DiagTask {
     }
 
     async fn stop_current_recording(&mut self, qmdl_store: &mut RecordingStore) {
+        crate::display::m2100_capture_profiles::note_stopped();
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset(None);
         let mut state = DiagState::Stopped;
         std::mem::swap(&mut self.state, &mut state);
         if let DiagState::Recording {
@@ -423,20 +442,53 @@ impl DiagTask {
 
             let container_bytes: usize = container.messages.iter().map(|m| m.data.len()).sum();
             self.bytes_since_space_check += container_bytes;
-            let max_type = match analysis_writer.analyze_container(container).await {
-                Ok(t) => t,
+            let (max_type, top) = match analysis_writer.analyze_container(container).await {
+                Ok(o) => (o.max_type, o.top),
                 Err(e) => {
                     warn!("failed to analyze container: {e}");
-                    EventType::Informational
+                    (EventType::Informational, None)
                 }
             };
 
             if max_type > EventType::Informational {
                 info!("a heuristic triggered on this run!");
+                // Say WHICH analyzer, on WHICH cell, WHEN -- not just "an event".
+                // The cell is read live from the modem; only the M2100 has that path.
+                let info = if matches!(self.device, Device::M2100) {
+                    tokio::task::spawn_blocking(display::m2100_signal::read_cell_info)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                let eci = info.as_ref().map(|c| c.global_cell_id);
+                let cell = info.map(|c| {
+                    format!(
+                        "eNB {} c{} PCI {} TAC {}",
+                        c.enodeb(),
+                        c.cell(),
+                        c.pci,
+                        c.tac
+                    )
+                });
+                let (analyzer, message) = top
+                    .map(|(name, e)| (name, e.message))
+                    .unwrap_or_else(|| ("unknown analyzer".to_string(), String::new()));
+                let alert = crate::alerts::Alert {
+                    at: chrono::Local::now(),
+                    severity: max_type,
+                    analyzer,
+                    message,
+                    cell,
+                    eci,
+                };
+                let text = crate::alerts::notification_text(&alert);
+                crate::alerts::record(alert);
                 self.notification_channel
                     .send(Notification::new(
                         NotificationType::Warning,
-                        format!("Rayhunter has detected a {:?} severity event", max_type),
+                        text,
                         Some(Duration::from_secs(60 * 5)),
                     ))
                     .await
@@ -475,6 +527,7 @@ pub fn run_diag_read_thread(
     min_space_to_continue_mb: u64,
     gps_mode: GpsMode,
     gps_fixed_coords: Option<(f64, f64)>,
+    live: Arc<Mutex<LiveObservations>>,
 ) {
     task_tracker.spawn(async move {
         info!("Using configuration for device: {0:?}", device);
@@ -494,6 +547,7 @@ pub fn run_diag_read_thread(
             min_space_to_continue_mb,
             gps_mode,
             gps_fixed_coords,
+            live,
         );
         qmdl_file_tx
             .send(DiagDeviceCtrlMessage::StartRecording { response_tx: None })
@@ -782,4 +836,84 @@ pub async fn get_analysis_report(
     let headers = [(CONTENT_TYPE, "application/x-ndjson")];
     let body = Body::from_stream(normalized_stream);
     Ok((headers, body).into_response())
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reset_on_start_names_new_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RecordingStore::create(dir.path()).await.unwrap();
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::channel(8);
+        let (an_tx, _an_rx) = tokio::sync::mpsc::channel(8);
+        let (n_tx, _n_rx) = tokio::sync::mpsc::channel(8);
+        let live = Arc::new(Mutex::new(LiveObservations::default()));
+        let mut task = DiagTask::new(
+            ui_tx,
+            an_tx,
+            AnalyzerConfig::default(),
+            Device::Tmobile,
+            n_tx,
+            0,
+            0,
+            GpsMode::Disabled,
+            None,
+            live.clone(),
+        );
+
+        task.start(&mut store).await.unwrap();
+        let a = live.lock().unwrap().snapshot().recording.clone();
+        assert!(a.is_some());
+        // Leftovers from "A" must not survive into "B".
+        let ev = rayhunter::analysis::analyzer::Event {
+            event_type: EventType::High,
+            message: "left over".into(),
+        };
+        live.lock().unwrap().warning(None, "x", &ev);
+        assert_eq!(live.lock().unwrap().snapshot().warnings.len(), 1);
+
+        task.start(&mut store).await.unwrap();
+        let s = live.lock().unwrap().snapshot();
+        let b = store.get_current_entry().unwrap().1.name.clone();
+        assert_eq!(s.recording, Some(b.clone()));
+        assert!(s.towers.is_empty() && s.warnings.is_empty());
+
+        task.stop_current_recording(&mut store).await;
+        assert_eq!(live.lock().unwrap().snapshot().recording, None);
+    }
+
+    #[tokio::test]
+    async fn recording_feeds_the_shared_live_collector() {
+        use rayhunter::diag::{DataType, MessagesContainer};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RecordingStore::create(dir.path()).await.unwrap();
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::channel(8);
+        let (an_tx, _an_rx) = tokio::sync::mpsc::channel(8);
+        let (n_tx, _n_rx) = tokio::sync::mpsc::channel(8);
+        let live = Arc::new(Mutex::new(LiveObservations::default()));
+        let mut task = DiagTask::new(
+            ui_tx,
+            an_tx,
+            AnalyzerConfig::default(),
+            Device::Tmobile,
+            n_tx,
+            0,
+            0,
+            GpsMode::Disabled,
+            None,
+            live.clone(),
+        );
+        task.start(&mut store).await.unwrap();
+        let container = MessagesContainer {
+            data_type: DataType::UserSpace,
+            num_messages: 1,
+            messages: vec![crate::analysis::live_tests::sib1_frame()],
+        };
+        task.process_container(&mut store, container).await;
+        let s = live.lock().unwrap().snapshot();
+        assert_eq!(s.towers.len(), 1, "{s:?}");
+        assert_eq!((s.towers[0].pci, s.towers[0].earfcn), (270, 1811));
+    }
 }

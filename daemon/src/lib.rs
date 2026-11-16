@@ -1,3 +1,4 @@
+pub mod alerts;
 pub mod analysis;
 pub mod battery;
 pub mod config;
@@ -8,6 +9,7 @@ pub mod error;
 pub mod gps;
 pub mod http_client;
 pub mod key_input;
+pub mod m2100_observe;
 pub mod notifications;
 pub mod pcap;
 pub mod qmdl_store;
@@ -53,7 +55,8 @@ use utoipa::OpenApi;
         server::set_time_offset,
         server::debug_set_display_state,
         gps::post_gps,
-        gps::get_gps
+        gps::get_gps,
+        server::get_m2100_live
     ),
     servers(
         (

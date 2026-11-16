@@ -1,3 +1,4 @@
+mod alerts;
 mod analysis;
 mod battery;
 mod config;
@@ -8,6 +9,7 @@ mod error;
 mod gps;
 mod http_client;
 mod key_input;
+mod m2100_observe;
 mod notifications;
 mod pcap;
 mod qmdl_store;
@@ -20,7 +22,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::battery::run_battery_notification_worker;
-use crate::config::{GpsMode, parse_args, parse_config};
+use crate::config::{GpsMode, UiLevel, parse_args, parse_config};
 use crate::diag::run_diag_read_thread;
 use crate::error::RayhunterError;
 use crate::gps::{get_gps, post_gps};
@@ -28,8 +30,10 @@ use crate::notifications::{NotificationService, run_notification_worker};
 use crate::pcap::get_pcap;
 use crate::qmdl_store::RecordingStore;
 use crate::server::{
-    ServerState, debug_set_display_state, get_analyzers, get_config, get_qmdl, get_time,
-    get_wifi_status, get_zip, scan_wifi, serve_static, set_config, set_time_offset,
+    ServerState, debug_set_display_state, get_analyzers, get_config, get_m2100_capture_profiles, get_m2100_live, get_m2100_profile, get_m2100_sha256,
+    post_m2100_fixed,
+    get_qmdl,
+    get_time, get_wifi_status, get_zip, scan_wifi, serve_static, set_config, set_time_offset,
     test_notification,
 };
 use crate::stats::{get_qmdl_manifest, get_system_stats, get_update_status};
@@ -88,6 +92,11 @@ fn get_router() -> AppRouter {
         .route("/api/debug/display-state", post(debug_set_display_state))
         .route("/api/gps", get(get_gps))
         .route("/api/gps", post(post_gps))
+        .route("/api/m2100/profile", get(get_m2100_profile))
+        .route("/api/m2100/capture-profiles", get(get_m2100_capture_profiles))
+        .route("/api/m2100/sha256/{name}", get(get_m2100_sha256))
+        .route("/api/m2100/live", get(get_m2100_live))
+        .route("/api/m2100/fixed", post(post_m2100_fixed))
         .route("/", get(|| async { Redirect::permanent("/index.html") }))
         .route("/{*path}", get(serve_static))
 }
@@ -225,6 +234,7 @@ async fn run_with_config(
     let notification_service = NotificationService::new(config.ntfy_url.clone());
     let update_status_lock = Arc::new(RwLock::new(UpdateStatus::default()));
 
+    let live: Arc<std::sync::Mutex<m2100_observe::LiveObservations>> = Arc::default();
     if !config.debug_mode {
         info!("Starting Diag Thread");
         let gps_fixed_coords = match (config.gps_fixed_latitude, config.gps_fixed_longitude) {
@@ -245,6 +255,7 @@ async fn run_with_config(
             config.min_space_to_continue_recording_mb,
             config.gps_mode,
             gps_fixed_coords,
+            live.clone(),
         );
         info!("Starting UI");
 
@@ -255,9 +266,27 @@ async fn run_with_config(
             Device::Wingtech => display::wingtech::update_ui,
             Device::Pinephone => display::headless::update_ui,
             Device::Uz801 => display::uz801::update_ui,
-            Device::M2100 => display::m2100::update_ui,
+            // The M2100 has two usable outputs and they cannot share the panel:
+            // rayhunter and the vendor UI (devuiappd) both write /dev/fb0.
+            //
+            //   ui_level = Invisible -> leave the panel entirely alone. The
+            //     device looks exactly like stock to anyone who picks it up;
+            //     the LED and buzzer remain available as quiet channels.
+            //   ui_level >= Subtle   -> take the panel and draw rayhunter's UI.
+            //
+            // Invisible is the default, so stock appearance is the default.
+            Device::M2100 => {
+                if config.ui_level == UiLevel::Invisible {
+                    display::m2100::update_ui
+                } else {
+                    display::m2100_framebuffer::update_ui
+                }
+            }
         };
         update_ui(&task_tracker, &config, shutdown_token.clone(), ui_update_rx);
+        if config.device == Device::M2100 {
+            display::m2100_profile_io::spawn_boot_reapply(&task_tracker);
+        }
 
         info!("Starting Key Input service");
         key_input::run_key_input_thread(
@@ -359,6 +388,7 @@ async fn run_with_config(
         wifi_status,
         wifi_scan_lock: tokio::sync::Mutex::new(()),
         gps_state: Arc::new(tokio::sync::RwLock::new(initial_gps)),
+        live,
         update_status_lock: update_status_lock.clone(),
     });
     run_server(&task_tracker, state, shutdown_token.clone()).await;

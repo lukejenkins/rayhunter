@@ -20,4 +20,5 @@ default-members = [
     "telcom-parser",
     "installer",
 ]
+exclude = ["m2100-archive", "m2100-decoder", "fleet-core", "fleet-sim"]
 resolver = "2"

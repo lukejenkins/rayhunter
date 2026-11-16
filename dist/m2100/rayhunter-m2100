@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""rayhunter-m2100: set up the M2100's reveal gesture and panic PIN.
+
+The gesture and PIN are never typed here and never pass through this computer:
+this script only asks the device to start enrolment, and you perform them on
+the panel. Python 3 standard library only.
+"""
+import subprocess
+import sys
+import time
+
+DIR = "/data/rayhunter"
+REVEAL = f"{DIR}/.reveal"
+PANIC = f"{DIR}/.panic"
+ENGAGED = f"{DIR}/.panic_engaged"
+REQUEST = f"{DIR}/.enrol_request"
+RESULT = f"{DIR}/.enrol_result"
+TOKEN = f"{DIR}/.api_token"
+WAIT = 150  # seconds; the device gives up at 120
+
+
+def adb_shell(cmd):
+    r = subprocess.run(["adb", "shell", cmd], capture_output=True, text=True, timeout=30)
+    return r.stdout.strip()
+
+
+def exists(shell, path):
+    return shell(f"test -e {path} && echo yes || echo no") == "yes"
+
+
+def status(shell, **_):
+    print("reveal gesture:", "set" if exists(shell, REVEAL) else "NOT SET (the panel stays stock)")
+    print("panic PIN:", "armed" if exists(shell, PANIC) else "not armed")
+    print("panic lockdown:", "ENGAGED" if exists(shell, ENGAGED) else "off")
+    return 0
+
+
+def request(shell, what, sleep):
+    shell(f"rm -f {RESULT}")
+    shell(f"echo {what} > {REQUEST}")
+    for _ in range(WAIT):
+        # 2>/dev/null: adb merges stderr into stdout, so without it a missing
+        # result reads as an answer.
+        answer = shell(f"cat {RESULT} 2>/dev/null")
+        if answer:
+            return answer
+        sleep(1)
+    return "no answer (is Rayhunter running?)"
+
+
+def enroll(shell, args, sleep, **_):
+    what = args[0] if args else "gesture"
+    if what == "pin":
+        print("The panic PIN is set on the device itself, after revealing Rayhunter:")
+        print("hold the left edge for 3 seconds to open settings, then tap the bottom half.")
+        return 1
+    if what != "gesture":
+        print("usage: rayhunter-m2100 enroll gesture")
+        return 2
+    print("On the device's home screen, perform your gesture, pause, then perform it again.")
+    print("Moves: swipes anywhere, and touches in the top strip (left, middle or right;")
+    print("only where counts, not how long). 5 to 8 moves. Aim at the very top edge.")
+    print("The LED blinks once per recognised move, twice for 'again', glows for 'saved',")
+    print("and blinks three times if it didn't work (it then starts over by itself).")
+    answer = request(shell, what, sleep)
+    print("device:", answer)
+    return 0 if answer.startswith("ok") else 1
+
+
+def reset(shell, args, ask, sleep, **_):
+    what = args[0] if args else ""
+    target = {"gesture": [REVEAL], "pin": [PANIC, ENGAGED]}.get(what)
+    if not target:
+        print("usage: rayhunter-m2100 reset gesture|pin")
+        return 2
+    note = " This disarms panic lockdown." if what == "pin" else ""
+    if ask(f"Delete the stored {what}?{note} [y/N] ").strip().lower() != "y":
+        print("Nothing changed.")
+        return 1
+    shell("rm -f " + " ".join(target))
+    print("device:", request(shell, "reload", sleep))
+    return 0
+
+
+def pair(shell, ask, **_):
+    """Make the token the Home Assistant add-on uses to ask for the Fixed profile.
+
+    It is made on the device and shown once, here, for you to paste into the
+    add-on's device_token setting.
+    """
+    if exists(shell, TOKEN):
+        if ask("This device already has a token. A new one stops the old one working. Replace it? [y/N] ").strip().lower() != "y":
+            print("Nothing changed.")
+            return 1
+    tmp = TOKEN + ".tmp"
+    shell(
+        f"umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \\n' > {tmp}"
+        f" && chmod 600 {tmp} && mv {tmp} {TOKEN}"
+    )
+    token = shell(f"cat {TOKEN} 2>/dev/null").strip()
+    if len(token) != 64 or any(c not in "0123456789abcdef" for c in token):
+        print("The device did not make a token. Is it connected over USB?")
+        return 1
+    print("Paste this into the add-on's device_token (it is not shown again):")
+    print()
+    print(token)
+    return 0
+
+
+def main(argv, shell=adb_shell, ask=input, sleep=time.sleep):
+    commands = {"status": status, "enroll": enroll, "reset": reset, "pair": pair}
+    if not argv or argv[0] not in commands:
+        print("usage: rayhunter-m2100 status | enroll gesture | reset gesture|pin | pair")
+        return 2
+    return commands[argv[0]](shell=shell, args=argv[1:], ask=ask, sleep=sleep)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

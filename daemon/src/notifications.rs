@@ -162,6 +162,18 @@ pub fn run_notification_worker(
                         continue;
                     }
 
+                    // M2100 Fixed profile: there is no path out, so drop it
+                    // rather than retry into a dead connection. The alert is
+                    // still on the panel and in Home Assistant.
+                    let profile = crate::display::m2100_profile::load(std::path::Path::new(
+                        crate::display::m2100_profile::PROFILE_PATH,
+                    ));
+                    if !crate::display::m2100_profile::ntfy_allowed(profile) {
+                        log::info!("ntfy: not sent, the device is in the fixed profile");
+                        notification.needs_sending = false;
+                        continue;
+                    }
+
                     // Backoff retries, up to a maximum of 256 seconds.
                     if let Some(last_attempt) = notification.last_attempt {
                         let min_wait_time = Duration::from_secs(

@@ -1,0 +1,65 @@
+name: Rayhunter archive
+version: "0.8.4"
+slug: rayhunter_archive
+description: Archives the Rayhunter captures from the M2100 and reports their health over MQTT
+arch:
+  - aarch64
+startup: application
+boot: auto
+init: false
+services:
+  - mqtt:need
+hassio_api: true
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:shield-alert
+panel_title: Sentinel
+# Serial access for the optional mesh radio (not `devices:`: a listed device that is
+# unplugged would stop the whole add-on from starting). See the README.
+uart: true
+backup_exclude:
+  - archive/*
+  - archive/*/*
+  - cwasm-cache/*
+options:
+  device_url: "http://192.168.1.1:8080"
+  device_token: ""
+  rhythm_tolerance_min: 15
+  fixed_learning_days: 14
+  rotate_hours: 6
+  rotate_disk_pct: 70
+  live_poll_secs: 60
+  live_test_alert: false
+  all_clear_hours: 3
+schema:
+  device_url: url
+  device_token: password
+  rhythm_tolerance_min: int(5,60)?
+  fixed_learning_days: int(7,60)?
+  # Capture rotation: restart recording every rotate_hours (0 = off), or once the
+  # unit's storage is rotate_disk_pct full (see README).
+  rotate_hours: int(0,48)?
+  rotate_disk_pct: int(50,95)?
+  # The unit's live view (needs device_token): polled every live_poll_secs; a strong
+  # finding goes out over the mesh within one poll. live_test_alert sends one TEST
+  # alert after start-up (see README).
+  live_poll_secs: int(30,600)?
+  live_test_alert: bool?
+  # The owner page's All clear unlocks once nothing has been seen for this many hours.
+  all_clear_hours: int(1,24)?
+  # Optional Cribl output, off unless all three are set (see README).
+  cribl_url: url?
+  cribl_token: password?
+  cribl_ca: str?
+  # Optional household mesh output (Meshtastic over USB serial), off unless mesh_port
+  # is set (see README, "Household sentinel (mesh)").
+  mesh_port: str?
+  mesh_level: list(strong|all)?
+  mesh_quiet_per_day: int(0,6)?
+  mesh_send_test: bool?
+  # Local hours with no "all quiet" pings, e.g. 22-7; alerts still go out.
+  mesh_quiet_hours: match(^([01]?[0-9]|2[0-3])-([01]?[0-9]|2[0-3])$)?
+  # Optional alert summary on the owner page, off unless summary_api_key is set. It is
+  # asked for only by a tap, and sends a scrubbed record to the Claude API (see README).
+  summary_api_key: password?
+  summary_model: str?

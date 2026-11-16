@@ -489,6 +489,18 @@ impl Harness {
         &mut self,
         maybe_qmdl_message: Result<Message, DiagParsingError>,
     ) -> AnalysisRow {
+        self.analyze_qmdl_message_with_element(maybe_qmdl_message).0
+    }
+
+    /// Like `analyze_qmdl_message`, but also hands back the decoded
+    /// `InformationElement` when the message got as far as having one (i.e.
+    /// it parsed, produced a GSMTAP message, and converted to an element).
+    /// `analyze_qmdl_message` is a wrapper around this, so the two always
+    /// agree on the row.
+    pub fn analyze_qmdl_message_with_element(
+        &mut self,
+        maybe_qmdl_message: Result<Message, DiagParsingError>,
+    ) -> (AnalysisRow, Option<InformationElement>) {
         let mut row = AnalysisRow::new();
         self.packet_num += 1;
 
@@ -496,7 +508,7 @@ impl Harness {
             Ok(msg) => msg,
             Err(err) => {
                 row.skipped_message_reason = Some(format!("{err:?}"));
-                return row;
+                return (row, None);
             }
         };
         let packet_timestamp = if let Message::Log { timestamp, .. } = &qmdl_message {
@@ -513,7 +525,7 @@ impl Harness {
                     row.events = self.report_skipped_packet(timestamp);
                     self.assert_events_match_analyzers(&row.events);
                 }
-                return row;
+                return (row, None);
             }
             Err(err) => {
                 row.skipped_message_reason = Some(format!("{err:?}"));
@@ -521,7 +533,7 @@ impl Harness {
                     row.events = self.report_skipped_packet(timestamp);
                     self.assert_events_match_analyzers(&row.events);
                 }
-                return row;
+                return (row, None);
             }
         };
 
@@ -531,13 +543,13 @@ impl Harness {
                 row.skipped_message_reason = Some(format!("{err:?}"));
                 row.events = self.report_skipped_packet(timestamp);
                 self.assert_events_match_analyzers(&row.events);
-                return row;
+                return (row, None);
             }
         };
 
         row.events = self.analyze_information_element(&element, timestamp);
         self.assert_events_match_analyzers(&row.events);
-        row
+        (row, Some(element))
     }
 
     pub fn analyze_qmdl_messages(&mut self, container: MessagesContainer) -> Vec<AnalysisRow> {
@@ -746,5 +758,76 @@ mod tests {
         )));
         let event = row.events[0].as_ref().expect("expected a warning event");
         assert!(event.message.ends_with(" (packet 3)"));
+    }
+
+    fn nas_message(ts: u64) -> Message {
+        log_message(
+            ts,
+            LogBody::Nas4GMessage {
+                log_type: 0xb0ec,
+                direction: Nas4GMessageDirection::Downlink,
+                ext_header_version: 0,
+                rrc_rel: 0,
+                rrc_version_minor: 0,
+                rrc_version_major: 0,
+                msg: vec![0x07, 0x55, 0x01],
+            },
+        )
+    }
+
+    fn sequence() -> Vec<Result<Message, DiagParsingError>> {
+        vec![
+            Ok(log_message(0, LogBody::IpTraffic { msg: vec![] })),
+            Ok(nas_message(800 << 16)),
+            Err(DiagParsingError::HdlcDecapsulationError(
+                crate::hdlc::HdlcError::InvalidChecksum(0, 1),
+                vec![1, 2, 3],
+            )),
+            Ok(nas_message(1600 << 16)),
+        ]
+    }
+
+    fn test_harness() -> Harness {
+        let mut harness = Harness::new();
+        harness.add_analyzer(
+            NoNasMessagesAnalyzer::metadata(),
+            Box::new(NoNasMessagesAnalyzer::new()),
+        );
+        harness
+    }
+
+    #[test]
+    fn test_wrapper_returns_same_rows_as_with_element() {
+        let mut a = test_harness();
+        let mut b = test_harness();
+        let mut some = 0;
+        for m in sequence() {
+            let wrapped = a.analyze_qmdl_message(m.clone());
+            let (row, element) = b.analyze_qmdl_message_with_element(m);
+            assert_eq!(
+                serde_json::to_value(&wrapped).unwrap(),
+                serde_json::to_value(&row).unwrap()
+            );
+            // element exists exactly when nothing stopped the message before analysis
+            if element.is_some() {
+                some += 1;
+                assert!(row.skipped_message_reason.is_none());
+            }
+        }
+        assert_eq!(some, 2, "the two NAS messages decode to elements");
+    }
+
+    #[test]
+    fn test_with_element_none_when_parse_fails_or_no_gsmtap() {
+        let mut h = test_harness();
+        let (row, el) = h.analyze_qmdl_message_with_element(Ok(log_message(
+            0,
+            LogBody::IpTraffic { msg: vec![] },
+        )));
+        assert!(el.is_none());
+        assert!(row.skipped_message_reason.is_none());
+        let (row, el) = h.analyze_qmdl_message_with_element(sequence().remove(2));
+        assert!(el.is_none());
+        assert!(row.skipped_message_reason.is_some());
     }
 }
