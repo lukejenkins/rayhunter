@@ -532,9 +532,11 @@ pub fn run_diag_read_thread(
     task_tracker.spawn(async move {
         info!("Using configuration for device: {0:?}", device);
         let mut dev = DiagDevice::new(&device)
-            .await?;
+            .await
+            .inspect_err(|e| error!("diag device open failed, not recording: {e}"))?;
         dev.config_logs()
-            .await?;
+            .await
+            .inspect_err(|e| error!("diag logging setup failed, not recording: {e}"))?;
 
         let mut diag_stream = pin!(dev.as_stream().into_stream());
         let mut diag_task = DiagTask::new(

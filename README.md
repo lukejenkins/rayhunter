@@ -13,7 +13,7 @@ It is a proof of concept meant for a household: one sentinel unit on a shelf, re
 
 | Part | What it does | Where |
 | --- | --- | --- |
-| Parser and diag fixes | The 24-byte msm-4.14 diag ioctl; strip the multi-radio header; keep log versions the parser doesn't know. Reported upstream in [discussion #560](https://github.com/EFForg/rayhunter/discussions/560). | `lib/`, `daemon/src/diag.rs` |
+| Parser and diag fixes | The 24-byte msm-4.14 diag ioctl; strip the multi-radio header; keep log versions the parser doesn't know. Zero-pad every logging-mode ioctl attempt (the ioctl carries no length, so shorter attempts handed the driver stack junk and it could hang when Rayhunter started after the vendor modem stack), and log diag setup failures. Reported upstream in [discussion #560](https://github.com/EFForg/rayhunter/discussions/560). | `lib/`, `daemon/src/diag.rs` |
 | Device support | LED and buzzer alerts, battery. | `daemon/` |
 | Touchscreen UI | A live status panel (serving cell, band, RSRP sparkline), settings, and alerts that name the analyser and time. Hidden behind the stock Inseego screen until you perform your own reveal gesture. | `daemon/src/display/` |
 | Panic lockdown | Off unless you arm it. Locked, the unit offers no ADB and no web interface, so it looks like an ordinary MiFi; an invisible PIN pad on the screen unlocks it. Forget the PIN and the only way back is a reflash. Captures stay unencrypted on flash. | `daemon/src/display/m2100_panic.rs` |

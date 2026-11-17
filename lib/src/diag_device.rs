@@ -224,31 +224,62 @@ impl DiagDevice {
         }
     }
 
+    /// Sends `req` and reads until `pick` recognises its reply. The reply is not always in the
+    /// first batch read back: other diag clients (vendor daemons on Android, the modem stack on
+    /// the M2100) share the device, so their traffic can come first. Reads are bounded by a
+    /// timeout and the request is re-sent a few times before giving up.
+    async fn request_reply<T>(
+        &mut self,
+        req: Request,
+        pick: impl Fn(u32, ResponsePayload) -> Option<T>,
+    ) -> DiagResult<T> {
+        const ATTEMPTS: u32 = 5;
+        const WAIT: Duration = Duration::from_secs(3);
+        for attempt in 1..=ATTEMPTS {
+            self.write_request(&req).await?;
+            let deadline = tokio::time::Instant::now() + WAIT;
+            let mut batches = 0u32;
+            loop {
+                let msgs = match tokio::time::timeout_at(deadline, self.read_response()).await {
+                    Ok(msgs) => msgs?,
+                    Err(_) => break,
+                };
+                batches += 1;
+                for msg in msgs {
+                    match msg {
+                        Ok(Message::Log { .. }) => debug!("skipping log message while waiting for reply"),
+                        Ok(Message::Response { payload, status, .. }) => {
+                            if let Some(found) = pick(status, payload) {
+                                if attempt > 1 || batches > 1 {
+                                    info!("diag reply arrived on attempt {attempt}, batch {batches}");
+                                }
+                                return Ok(found);
+                            }
+                            debug!("skipping unrelated response while waiting for reply");
+                        }
+                        Err(e) => error!("error parsing message: {e:?}"),
+                    }
+                }
+            }
+            info!("no diag reply after {batches} batches (attempt {attempt}/{ATTEMPTS}), re-sending");
+        }
+        Err(DiagDeviceError::NoResponse(req))
+    }
+
     async fn retrieve_id_ranges(&mut self) -> DiagResult<[u32; 16]> {
         let req = Request::LogConfig(LogConfigRequest::RetrieveIdRanges);
-        self.write_request(&req).await?;
-
-        for msg in self.read_response().await? {
-            match msg {
-                Ok(Message::Log { .. }) => info!("skipping log response..."),
-                Ok(Message::Response {
-                    payload, status, ..
-                }) => match payload {
-                    ResponsePayload::LogConfig(LogConfigResponse::RetrieveIdRanges {
-                        log_mask_sizes,
-                    }) => {
-                        if status != 0 {
-                            return Err(DiagDeviceError::RequestFailed(status, req));
-                        }
-                        return Ok(log_mask_sizes);
-                    }
-                    _ => info!("skipping non-LogConfigResponse response..."),
-                },
-                Err(e) => error!("error parsing message: {e:?}"),
-            }
+        let (status, sizes) = self
+            .request_reply(req.clone(), |status, payload| match payload {
+                ResponsePayload::LogConfig(LogConfigResponse::RetrieveIdRanges { log_mask_sizes }) => {
+                    Some((status, log_mask_sizes))
+                }
+                _ => None,
+            })
+            .await?;
+        if status != 0 {
+            return Err(DiagDeviceError::RequestFailed(status, req));
         }
-
-        Err(DiagDeviceError::NoResponse(req))
+        Ok(sizes)
     }
 
     async fn set_log_mask(&mut self, log_type: u32, log_mask_bitsize: u32) -> DiagResult<()> {
@@ -257,26 +288,16 @@ impl DiagDevice {
             log_mask_bitsize,
             &LOG_CODES_FOR_RAW_PACKET_LOGGING,
         );
-        self.write_request(&req).await?;
-
-        for msg in self.read_response().await? {
-            match msg {
-                Ok(Message::Log { .. }) => info!("skipping log response..."),
-                Ok(Message::Response {
-                    payload, status, ..
-                }) => {
-                    if let ResponsePayload::LogConfig(LogConfigResponse::SetMask) = payload {
-                        if status != 0 {
-                            return Err(DiagDeviceError::RequestFailed(status, req));
-                        }
-                        return Ok(());
-                    }
-                }
-                Err(e) => error!("error parsing message: {e:?}"),
-            }
+        let status = self
+            .request_reply(req.clone(), |status, payload| match payload {
+                ResponsePayload::LogConfig(LogConfigResponse::SetMask) => Some(status),
+                _ => None,
+            })
+            .await?;
+        if status != 0 {
+            return Err(DiagDeviceError::RequestFailed(status, req));
         }
-
-        Err(DiagDeviceError::NoResponse(req))
+        Ok(())
     }
 
     pub async fn config_logs(&mut self) -> DiagResult<()> {
@@ -310,10 +331,10 @@ struct DiagLoggingModeParam {
     mode_param: u8,
 }
 
-// msm-4.x extended layout (SDX55 / kernel 4.14 and later). The driver does a
-// strict `len == sizeof(struct diag_logging_mode_param_t)` check and returns
-// -EINVAL on anything else, so the 12-byte struct above is rejected outright
-// on these kernels even though the pointer is perfectly valid.
+// msm-4.x extended layout (SDX55 / kernel 4.14 and later). The ioctl carries no
+// length: the driver always copies its own sizeof (24 bytes on mainline
+// msm-4.14) from the pointer. A shorter struct is "rejected" only because of
+// what the driver reads past its end; see `padded()`.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 struct DiagLoggingModeParamV2 {
@@ -342,11 +363,29 @@ struct DiagLoggingModeParamV3 {
     device_mask: i32,
 }
 
+// Every layout is passed inside a zeroed buffer at least as large as the
+// largest one. The driver reads its full struct size whatever we meant to send,
+// so an unpadded short struct hands it the stack bytes behind it. On a Pixel 4
+// (msm-4.14) junk landing in `pd_mask` made the 12-byte attempt fail with
+// EINVAL *and* left driver state behind: the 24-byte attempt that followed
+// returned 0 but created no memory-device session, so every later write was
+// refused ("request came from invalid md session pid"). Whether it broke
+// depended on what was on the stack, which is why it looked like boot timing.
+fn padded<T: Copy>(p: &T) -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    let n = std::mem::size_of::<T>();
+    assert!(n <= buf.len());
+    // SAFETY: T is plain-old-data (repr(C) param structs) and n fits in buf.
+    unsafe { std::ptr::copy_nonoverlapping(p as *const T as *const u8, buf.as_mut_ptr(), n) };
+    buf
+}
+
 // Triggers the diag device's debug logging mode.
 //
 // Kernels differ in what this ioctl accepts. Older ones take the mode as a bare
-// int; msm-4.x takes a pointer to a struct and enforces an exact size match,
-// returning -EINVAL for any other length. Rather than guess, walk a ladder of
+// int; msm-4.x takes a pointer to a struct of its own size and rejects one whose
+// fields it cannot accept (a zeroed `device_mask` is -EINVAL there, for
+// example). Every attempt is zero-padded (`padded()`). Rather than guess, walk a ladder of
 // known shapes and log what each one returns, so a total failure still yields a
 // usable bug report.
 fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> DiagResult<()> {
@@ -374,7 +413,7 @@ fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> Dia
             let mut p = DiagLoggingModeParam { req_mode: mode, peripheral_mask: 0, mode_param: 1 };
             let r = libc::ioctl(
                 fd, DIAG_IOCTL_SWITCH_LOGGING,
-                &mut p as *mut DiagLoggingModeParam,
+                padded(&p).as_mut_ptr(),
                 std::mem::size_of::<DiagLoggingModeParam>(), 0, 0, 0, 0,
             );
             log::info!("diag probe: v1 tplink (12B)    -> ret={r} errno={:?}",
@@ -387,7 +426,7 @@ fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> Dia
             let mut p1 = DiagLoggingModeParam { req_mode: mode, peripheral_mask: mask, mode_param: 0 };
             let r = libc::ioctl(
                 fd, DIAG_IOCTL_SWITCH_LOGGING,
-                &mut p1 as *mut DiagLoggingModeParam,
+                padded(&p1).as_mut_ptr(),
                 std::mem::size_of::<DiagLoggingModeParam>(), 0, 0, 0, 0,
             );
             log::info!("diag probe: v1 ({:>2}B) mask={label} -> ret={r} errno={:?}",
@@ -401,7 +440,7 @@ fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> Dia
             };
             let r = libc::ioctl(
                 fd, DIAG_IOCTL_SWITCH_LOGGING,
-                &mut p2 as *mut DiagLoggingModeParamV2,
+                padded(&p2).as_mut_ptr(),
                 std::mem::size_of::<DiagLoggingModeParamV2>(), 0, 0, 0, 0,
             );
             log::info!("diag probe: v2 ({:>2}B) mask={label} -> ret={r} errno={:?}",
@@ -409,13 +448,13 @@ fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> Dia
             if r == 0 { return Ok(()); }
 
             // 24-byte with device_mask
-            let mut p3 = DiagLoggingModeParamV3 {
+            let p3 = DiagLoggingModeParamV3 {
                 req_mode: mode, peripheral_mask: mask, pd_mask: 0,
                 mode_param: 0, diag_id: 0, pd_val: 0, reserved: 0, peripheral: 0, device_mask: 1,
             };
             let r = libc::ioctl(
                 fd, DIAG_IOCTL_SWITCH_LOGGING,
-                &mut p3 as *mut DiagLoggingModeParamV3,
+                padded(&p3).as_mut_ptr(),
                 std::mem::size_of::<DiagLoggingModeParamV3>(), 0, 0, 0, 0,
             );
             log::info!("diag probe: v3 ({:>2}B) mask={label} -> ret={r} errno={:?}",
@@ -440,4 +479,21 @@ fn determine_use_mdm(fd: i32) -> DiagResult<i32> {
         }
     }
     Ok(use_mdm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn padded_keeps_the_struct_and_zeroes_what_the_driver_reads_past_it() {
+        let p = DiagLoggingModeParam { req_mode: 2, peripheral_mask: u32::MAX, mode_param: 7 };
+        let buf = padded(&p);
+        assert_eq!(&buf[0..4], &2u32.to_ne_bytes());
+        assert_eq!(&buf[4..8], &u32::MAX.to_ne_bytes());
+        assert_eq!(buf[8], 7);
+        let n = std::mem::size_of::<DiagLoggingModeParam>();
+        assert!(buf[n..].iter().all(|&b| b == 0), "tail must be zero, not stack bytes");
+        assert!(buf.len() >= std::mem::size_of::<DiagLoggingModeParamV3>());
+    }
 }

@@ -59,6 +59,13 @@ Everything below was developed privately and published together in November 2026
 
 ## Device (M2100)
 
+### 2026-11-04 (merged 2026-11-17)
+- Diag: every logging-mode ioctl attempt is zero-padded, and diag setup failures are logged
+  instead of swallowed. The ioctl carries no length, so the shorter attempts handed the driver
+  stack junk; that, not boot timing, is why Rayhunter could hang when started after the vendor
+  modem stack. Commits [`9f85107`](https://github.com/mallorybowes/rayhunter/commit/9f85107),
+  [`9b0da46`](https://github.com/mallorybowes/rayhunter/commit/9b0da46).
+
 ### 2026-10-16
 - `fleet-core` and `fleet-sim`: an early protocol for a group of sentinels (signed, revocable
   messages) and a simulator. No radio adapter yet.
