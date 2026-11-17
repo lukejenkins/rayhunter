@@ -27,6 +27,7 @@ It is a proof of concept meant for a household: one sentinel unit on a shelf, re
 
 | I want to... | Read |
 | --- | --- |
+| See everything this build does, with pictures | [`M2100-FEATURES.md`](M2100-FEATURES.md) |
 | Set the reveal gesture, panic PIN and profile | [`dist/m2100/INSTALL-gesture.md`](dist/m2100/INSTALL-gesture.md) (quick reference at the top) |
 | Install and run the Home Assistant add-on | [`m2100-archive/README.md`](m2100-archive/README.md) (cheat sheet at the top) |
 | Know what a finding or check id means | `m2100-archive/README.md`, "Check ids" |
