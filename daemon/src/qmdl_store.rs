@@ -301,6 +301,28 @@ impl RecordingStore {
         toml::from_str(&file_contents).map_err(RecordingStoreError::ParseManifestError)
     }
 
+    /// The first name at or after `timestamp` that no manifest entry or QMDL
+    /// file uses yet. A device without a real-time clock boots to the same
+    /// time when nothing sets its clock, and two starts can land in the same
+    /// second, so a new recording would otherwise overwrite an earlier one.
+    /// The name stays numeric so that `recover_manifest` can still read it.
+    async fn unused_name(&self, timestamp: i64) -> String {
+        let mut candidate = timestamp;
+        loop {
+            let name = candidate.to_string();
+            let in_manifest = self.manifest.entries.iter().any(|e| e.name == name);
+            let mut on_disk = false;
+            for compressed in [false, true] {
+                let path = FileKind::Qmdl.get_filepath(&name, &self.path, compressed);
+                on_disk |= try_exists(&path).await.unwrap_or(true);
+            }
+            if !in_manifest && !on_disk {
+                return name;
+            }
+            candidate += 1;
+        }
+    }
+
     // Closes the current entry (if needed), creates a new entry based on the
     // current time, and updates the manifest. Returns a tuple of the entry's
     // newly created QMDL file and analysis file.
@@ -312,7 +334,8 @@ impl RecordingStore {
         if self.current_entry.is_some() {
             self.close_current_entry().await?;
         }
-        let new_entry = ManifestEntry::new(gps_mode);
+        let mut new_entry = ManifestEntry::new(gps_mode);
+        new_entry.name = self.unused_name(new_entry.start_time.timestamp()).await;
         let qmdl_filepath = new_entry.get_filepath(FileKind::Qmdl, &self.path);
         let qmdl_file = File::create(&qmdl_filepath)
             .await
@@ -578,6 +601,44 @@ mod tests {
         assert!(RecordingStore::exists(dir.path()).await.unwrap());
         let loaded_store = RecordingStore::load(dir.path()).await.unwrap();
         assert_eq!(loaded_store.manifest.entries.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_new_entry_never_reuses_an_existing_name() {
+        let dir = make_temp_dir();
+        let mut store = RecordingStore::create(dir.path()).await.unwrap();
+        let _ = store.new_entry(GpsMode::Disabled).await.unwrap();
+        let first = store.manifest.entries[0].name.clone();
+        let second = store.unused_name(first.parse().unwrap()).await;
+        assert_ne!(second, first);
+        assert_eq!(
+            second.parse::<i64>().unwrap(),
+            first.parse::<i64>().unwrap() + 1
+        );
+
+        // A QMDL file the manifest has lost still claims its name.
+        let orphan = first.parse::<i64>().unwrap() + 1;
+        fs::write(dir.path().join(format!("{orphan}.qmdl.gz")), b"")
+            .await
+            .unwrap();
+        let third = store.unused_name(first.parse().unwrap()).await;
+        assert_eq!(third.parse::<i64>().unwrap(), orphan + 1);
+    }
+
+    #[tokio::test]
+    async fn two_entries_in_the_same_second_get_different_names() {
+        let dir = make_temp_dir();
+        let mut store = RecordingStore::create(dir.path()).await.unwrap();
+        let _ = store.new_entry(GpsMode::Disabled).await.unwrap();
+        let _ = store.new_entry(GpsMode::Disabled).await.unwrap();
+        let names: Vec<_> = store
+            .manifest
+            .entries
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert_ne!(names[0], names[1]);
     }
 
     #[tokio::test]
