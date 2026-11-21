@@ -7,7 +7,7 @@ use crate::{Device, log_codes};
 
 use deku::prelude::*;
 use futures::TryStream;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
@@ -313,7 +313,23 @@ impl DiagDevice {
 
     pub async fn config_logs(&mut self) -> DiagResult<()> {
         info!("retrieving diag logging capabilities...");
-        let log_mask_sizes = self.retrieve_id_ranges().await?;
+        let log_mask_sizes = match self.retrieve_id_ranges().await {
+            // DIAG_IOCTL_REMOTE_DEV can report a remote device that never
+            // answers. On the Inseego M2100 (SDX55, kernel 4.14) the mask reads
+            // 0x0 when rayhunter starts early in boot but 0x1 once boot has
+            // finished, and every request routed to that remote goes
+            // unanswered. The local modem answers the same requests, so try it
+            // before giving up.
+            Err(DiagDeviceError::NoResponse(_)) if self.use_mdm > 0 => {
+                warn!(
+                    "no reply with requests routed to the remote device (mask {:#x}); retrying on the local modem",
+                    self.use_mdm
+                );
+                self.use_mdm = 0;
+                self.retrieve_id_ranges().await?
+            }
+            result => result?,
+        };
 
         for (log_type, &log_mask_bitsize) in log_mask_sizes.iter().enumerate() {
             if log_mask_bitsize > 0 {
