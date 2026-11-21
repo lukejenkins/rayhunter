@@ -9,10 +9,12 @@ use deku::prelude::*;
 /// asserts on it, which turns every other version into a hard parse failure
 /// for the whole message.
 ///
-/// The Inseego M2100 (Qualcomm SDX55) emits MAC DL (0xb063) as version **49**,
-/// while MAC UL (0xb064) and RACH (0xb062) on the same device are version 1 and
-/// parse normally -- 245 failures in one 16-hour capture. Nothing consumes MAC
-/// DL, so an unrecognised version is kept as opaque bytes rather than failing.
+/// The Inseego M2100 (Qualcomm SDX55) emits MAC DL (0xb063) as version **49**
+/// (0x31), while MAC UL (0xb064) and RACH (0xb062) on the same device are
+/// version 1 and parse normally -- 245 failures in one 16-hour capture. MAC DL
+/// now has its own type, [`DlTransportBlock`], because its 0x31 and 0x32
+/// layouts are not this subpacket container. For these log codes an
+/// unrecognised version is kept as opaque bytes rather than failing.
 #[derive(DekuRead, DekuWrite, Debug, Clone, PartialEq)]
 #[deku(ctx = "hdr_len: u16")]
 pub struct Packet {
@@ -45,6 +47,80 @@ impl Packet {
         match &self.body {
             PacketBody::V1 { subpackets, .. } => subpackets,
             PacketBody::Unsupported { .. } => &[],
+        }
+    }
+}
+
+/// LTE MAC DL transport block (0xb063), keyed on the version byte.
+///
+/// - Version 1 is the same subpacket container as [`Packet`].
+/// - Version 0x31 (SDX55: Inseego M2100, Orbic R500L5) is a flat layout: an
+///   8-byte header (counting the version byte), 532 bytes of per-cell
+///   statistics, then `num_entries` transport block entries.
+/// - Version 0x32 (SDX65: Inseego M3100) has the same 8-byte header and no
+///   per-cell statistics block: the entries start right after the header.
+///
+/// Entries can carry a variable-length extension (record sizes are not a fixed
+/// multiple of `num_entries`), so they are kept as raw bytes rather than framed
+/// here. Any other version is kept as opaque bytes.
+#[derive(DekuRead, DekuWrite, Debug, Clone, PartialEq)]
+#[deku(ctx = "hdr_len: u16")]
+pub struct DlTransportBlock {
+    pub version: u8,
+    #[deku(ctx = "*version, hdr_len.saturating_sub(1)")]
+    pub body: DlTransportBlockBody,
+}
+
+#[derive(DekuRead, DekuWrite, Debug, Clone, PartialEq)]
+#[deku(ctx = "version: u8, len: u16", id = "version")]
+pub enum DlTransportBlockBody {
+    #[deku(id = "1")]
+    V1 {
+        num_subpackets: u8,
+        #[deku(pad_bytes_before = "2", count = "num_subpackets")]
+        subpackets: Vec<Subpacket>,
+    },
+    #[deku(id = "0x31")]
+    V31 {
+        unknown1: [u8; 3],
+        num_entries: u16,
+        unknown2: u16,
+        #[deku(count = "532")]
+        cell_stats: Vec<u8>,
+        #[deku(count = "len.saturating_sub(539)")]
+        entries: Vec<u8>,
+    },
+    #[deku(id = "0x32")]
+    V32 {
+        unknown1: [u8; 3],
+        num_entries: u16,
+        unknown2: u16,
+        #[deku(count = "len.saturating_sub(7)")]
+        entries: Vec<u8>,
+    },
+    /// Unknown layout, not unknown data -- keep the bytes.
+    #[deku(id_pat = "_")]
+    Unsupported {
+        #[deku(count = "len")]
+        data: Vec<u8>,
+    },
+}
+
+impl DlTransportBlock {
+    /// The subpackets of a version 1 block; empty for every other version.
+    pub fn subpackets(&self) -> &[Subpacket] {
+        match &self.body {
+            DlTransportBlockBody::V1 { subpackets, .. } => subpackets,
+            _ => &[],
+        }
+    }
+
+    /// The number of transport block entries, where the layout records it.
+    pub fn num_entries(&self) -> Option<u16> {
+        match &self.body {
+            DlTransportBlockBody::V31 { num_entries, .. }
+            | DlTransportBlockBody::V32 { num_entries, .. } => Some(*num_entries),
+            _ => None,
         }
     }
 }
@@ -319,6 +395,77 @@ pub(crate) mod test {
         } else {
             panic!("not rach attempt {:?}", packet.subpackets()[0].body);
         }
+    }
+
+    fn parse_dl(hex: &str) -> DlTransportBlock {
+        let (total_size, mut reader) = unhexlify(hex);
+        let block = DlTransportBlock::from_reader_with_ctx(&mut reader, total_size as u16).unwrap();
+        let consumed = reader.stream_position().unwrap() as usize;
+        assert_eq!(consumed, total_size, "left bytes unread");
+        block
+    }
+
+    /// Synthetic 0x31 block: header, 532 bytes of statistics, `entries`.
+    fn dl_v31(num_entries: u16, entries: &str) -> String {
+        format!(
+            "31000000{}0000{}{entries}",
+            hex_u16(num_entries),
+            "00".repeat(532)
+        )
+    }
+
+    fn hex_u16(v: u16) -> String {
+        v.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn mac_dl_v31_keeps_statistics_and_entries() {
+        let block = parse_dl(&dl_v31(2, "0102030405060708"));
+        assert_eq!(block.version, 0x31);
+        assert_eq!(block.num_entries(), Some(2));
+        assert!(block.subpackets().is_empty());
+        let DlTransportBlockBody::V31 {
+            cell_stats,
+            entries,
+            ..
+        } = block.body
+        else {
+            panic!("expected V31");
+        };
+        assert_eq!(cell_stats.len(), 532);
+        assert_eq!(entries, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn mac_dl_v32_has_no_statistics_block() {
+        let block = parse_dl(&format!("32000000{}0000aabbccdd", hex_u16(3)));
+        assert_eq!(block.num_entries(), Some(3));
+        let DlTransportBlockBody::V32 { entries, .. } = block.body else {
+            panic!("expected V32");
+        };
+        assert_eq!(entries, vec![0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn mac_dl_v1_is_the_subpacket_container() {
+        // The first SCAT RACH vector is a version 1 container too.
+        let hex =
+            "0101a06906022400010001071BFF98FF000001231A0400181C010007000600465C80BD0648000000";
+        let block = parse_dl(hex);
+        assert_eq!(block.subpackets().len(), 1);
+        assert_eq!(block.num_entries(), None);
+        assert_eq!(block.subpackets(), parse_rach_packet(hex).subpackets());
+    }
+
+    #[test]
+    fn mac_dl_unknown_version_is_kept_as_bytes() {
+        let block = parse_dl("33010203");
+        assert_eq!(
+            block.body,
+            DlTransportBlockBody::Unsupported {
+                data: vec![1, 2, 3]
+            }
+        );
     }
 
     #[test]

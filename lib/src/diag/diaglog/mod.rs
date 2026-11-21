@@ -94,7 +94,7 @@ pub enum LogBody {
     #[deku(id = "0xb063")]
     LteMacDl {
         #[deku(ctx = "hdr_len")]
-        packet: mac::Packet,
+        packet: mac::DlTransportBlock,
     },
     #[deku(id = "0xb064")]
     LteMacUl {
@@ -183,9 +183,9 @@ pub(crate) mod test {
     }
 
     /// Real messages captured from an Inseego M2100 (Qualcomm SDX55), 2026-09-24.
-    /// This modem emits ServingCellTiming with version 161 and MAC DL with
-    /// version 49; upstream hard-asserts version == 1 for both, so every one of
-    /// them fails to parse. In one 16-hour capture that was 29,577 of 29,658
+    /// This modem emits ServingCellTiming with version 161 (0xa1) and MAC DL
+    /// with version 49 (0x31); upstream hard-asserts version == 1 for both, so
+    /// every one of them failed to parse. In one 16-hour capture that was 29,577 of 29,658
     /// skipped messages -- 98.9% of them ServingCellTiming alone -- which no
     /// analyser consumes, but which produced a 186MB error log from a 14.9MB
     /// source and filled the device's rootfs.
@@ -200,28 +200,47 @@ pub(crate) mod test {
 
     /// The same modem emits MAC DL (0xb063) as version 49. 245 of them in the
     /// capture that produced the ServingCellTiming finding, and like that one
-    /// no analyser consumes it -- but an assert turns every one into a hard
+    /// no analyser consumes it -- but an assert turned every one into a hard
     /// parse failure for the whole message.
     const MAC_DL_V49: &str = "10005002500263b049940b10979d12013100000001000100c1420000000000000000000000000000000000000000000000000000c2440000000000000000000000000000000000000000000000000000c30603000100000001000000010000000000000001000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000029000000000000004e610200100203003903004b2c740f14d8010000001000000001000000000000";
 
+    /// Offset of the version byte in these messages: command, pending
+    /// messages, two lengths, log type and timestamp come first.
+    const VERSION_OFFSET: usize = 16;
+
+    /// Parse a whole message and insist that nothing is left over, so a
+    /// layout that reads too little or too much fails here.
+    fn parse_all(data: &[u8]) -> Message {
+        let ((rest, _), msg) = Message::from_bytes((data, 0)).unwrap();
+        assert!(rest.is_empty(), "{} bytes left over", rest.len());
+        msg
+    }
+
     #[test]
-    fn test_mac_packet_with_an_unknown_version_still_parses() {
+    fn test_mac_dl_version_49_from_the_m2100_decodes() {
         let data = unhex(MAC_DL_V49);
-        let msg = Message::from_bytes((&data, 0))
-            .expect("a MAC version this parser does not know must not fail the message")
-            .1;
-        match msg {
-            Message::Log {
-                log_type,
-                body: LogBody::LteMacDl { packet },
+        let Message::Log {
+            log_type: 0xb063,
+            inner_length,
+            body: LogBody::LteMacDl { packet },
+            ..
+        } = parse_all(&data)
+        else {
+            panic!("expected a MAC DL log");
+        };
+        assert_eq!(packet.version, 49);
+        assert_eq!(packet.num_entries(), Some(1));
+        match &packet.body {
+            mac::DlTransportBlockBody::V31 {
+                cell_stats,
+                entries,
                 ..
             } => {
-                assert_eq!(log_type, 0xb063);
-                assert_eq!(packet.version, 49);
-                // Nothing usable, but nothing lost either.
-                assert!(packet.subpackets().is_empty());
+                assert_eq!(cell_stats.len(), 532);
+                // Header (8 bytes with the version) and statistics come first.
+                assert_eq!(entries.len(), inner_length as usize - 12 - 540);
             }
-            other => panic!("expected a MAC DL log, got {other:?}"),
+            other => panic!("expected a V31 body, got {other:?}"),
         }
     }
 
@@ -229,20 +248,21 @@ pub(crate) mod test {
     /// Without this, a variant that silently read nothing would pass.
     #[test]
     fn test_an_unsupported_mac_version_keeps_its_payload() {
-        let data = unhex(MAC_DL_V49);
-        let msg = Message::from_bytes((&data, 0)).unwrap().1;
+        let mut data = unhex(MAC_DL_V49);
+        data[VERSION_OFFSET] = 0x33;
         let Message::Log {
             inner_length,
             body: LogBody::LteMacDl { packet },
             ..
-        } = msg
+        } = parse_all(&data)
         else {
             panic!("expected a MAC DL log");
         };
+        assert!(packet.subpackets().is_empty());
         match &packet.body {
-            mac::PacketBody::Unsupported { data } => {
+            mac::DlTransportBlockBody::Unsupported { data } => {
                 // Everything after the version byte.
-                assert_eq!(data.len() as usize, inner_length as usize - 12 - 1);
+                assert_eq!(data.len(), inner_length as usize - 12 - 1);
             }
             other => panic!("expected an Unsupported body, got {other:?}"),
         }
@@ -250,40 +270,43 @@ pub(crate) mod test {
 
     #[test]
     fn test_an_unsupported_serving_cell_timing_keeps_its_payload() {
-        let data = unhex(SERVING_CELL_TIMING_V161);
-        let msg = Message::from_bytes((&data, 0)).unwrap().1;
+        let mut data = unhex(SERVING_CELL_TIMING_V161);
+        data[VERSION_OFFSET] = 0xa2;
         let Message::Log {
             inner_length,
             body: LogBody::LteLl1ServingCellTiming { data: sct },
             ..
-        } = msg
+        } = parse_all(&data)
         else {
             panic!("expected a ServingCellTiming log");
         };
         match &sct.body {
             ll1::ServingCellTimingBody::Unsupported { data } => {
-                assert_eq!(data.len() as usize, inner_length as usize - 12 - 1);
+                assert_eq!(data.len(), inner_length as usize - 12 - 1);
             }
             other => panic!("expected an Unsupported body, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_serving_cell_timing_with_an_unknown_version_still_parses() {
+    fn test_serving_cell_timing_version_161_from_the_m2100_decodes() {
         let data = unhex(SERVING_CELL_TIMING_V161);
-        let msg = Message::from_bytes((&data, 0))
-            .expect("a version this parser does not know must not fail the whole message")
-            .1;
-        match msg {
-            Message::Log {
-                log_type,
-                body: LogBody::LteLl1ServingCellTiming { data },
-                ..
-            } => {
-                assert_eq!(log_type, 0xb114);
-                assert_eq!(data.version, 161);
+        let Message::Log {
+            log_type: 0xb114,
+            body: LogBody::LteLl1ServingCellTiming { data },
+            ..
+        } = parse_all(&data)
+        else {
+            panic!("expected a ServingCellTiming log");
+        };
+        assert_eq!(data.version, 161);
+        match &data.body {
+            ll1::ServingCellTimingBody::VA1(v) => {
+                assert_eq!(v.num_records, 5);
+                assert_eq!(v.records.len(), 5);
+                assert!(v.records.iter().all(|r| r.sub_fn <= 9));
             }
-            other => panic!("expected a ServingCellTiming log, got {other:?}"),
+            other => panic!("expected a VA1 body, got {other:?}"),
         }
     }
 
