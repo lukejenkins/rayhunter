@@ -17,6 +17,15 @@ pub const MESSAGE_ESCAPE_CHAR: u8 = 0x7d;
 pub const ESCAPED_MESSAGE_TERMINATOR: u8 = 0x5e;
 pub const ESCAPED_MESSAGE_ESCAPE_CHAR: u8 = 0x5d;
 
+/// Command code of the multi-radio envelope (`DIAG_MULTI_RADIO_CMD_F` in
+/// Qualcomm's DIAG command list) that some modems wrap around every message
+/// they send. See [`Message::strip_multi_radio_header`].
+pub const DIAG_MULTI_RADIO_CMD_F: u8 = 0x98;
+/// The only envelope version seen so far.
+const MULTI_RADIO_VERSION: u8 = 0x01;
+/// Command code, version, two reserved bytes, then a 32-bit field.
+const MULTI_RADIO_HEADER_LEN: usize = 8;
+
 #[derive(Debug, Clone, DekuWrite)]
 pub struct RequestContainer {
     pub data_type: DataType,
@@ -151,9 +160,21 @@ impl Message {
     /// decapsulation succeeds and only the subsequent parse fails -- the leading
     /// 0x98 is read as a Response opcode, yielding
     /// "ID 408 not found on ResponsePayload" (408 == 0x0198).
+    ///
+    /// 0x98 is [`DIAG_MULTI_RADIO_CMD_F`]. Only version 1 with both reserved
+    /// bytes zero is unwrapped, and only when a message follows the header;
+    /// anything else is parsed as it is. How many messages arrive wrapped
+    /// depends on the firmware image, not only on the chipset: on one SDX55
+    /// MiFiOS image about half the log messages were wrapped, on another
+    /// nearly all of them.
     fn strip_multi_radio_header(data: &[u8]) -> &[u8] {
-        if data.len() > 8 && data[0] == 0x98 && data[1] == 0x01 && data[2] == 0 && data[3] == 0 {
-            &data[8..]
+        if data.len() > MULTI_RADIO_HEADER_LEN
+            && data[0] == DIAG_MULTI_RADIO_CMD_F
+            && data[1] == MULTI_RADIO_VERSION
+            && data[2] == 0
+            && data[3] == 0
+        {
+            &data[MULTI_RADIO_HEADER_LEN..]
         } else {
             data
         }
@@ -222,4 +243,86 @@ pub fn build_log_mask_request(
         log_mask_bitsize,
         log_mask,
     })
+}
+
+#[cfg(test)]
+mod multi_radio_test {
+    use super::*;
+    use crate::hdlc::hdlc_encapsulate;
+
+    /// A synthetic outgoing EMM NAS log (0xb0ed): the 12-byte log header,
+    /// four version bytes, then a three-byte NAS message.
+    const NAS_LOG: [u8; 23] = [
+        0x10, 0x00, // log command, pending messages
+        0x13, 0x00, 0x13, 0x00, // outer and inner length (19)
+        0xed, 0xb0, // log type 0xb0ed
+        0, 0, 0, 0, 0, 0, 0, 0, // timestamp
+        0x01, 0x09, 0x00, 0x05, // ext header version, RRC release, minor, major
+        0x07, 0x5d, 0x00, // NAS message bytes
+    ];
+
+    fn wrap(header: &[u8], message: &[u8]) -> Vec<u8> {
+        let mut data = header.to_vec();
+        data.extend_from_slice(message);
+        hdlc_encapsulate(&data, &CRC_CCITT)
+    }
+
+    fn assert_is_the_nas_log(message: &Message) {
+        match message {
+            Message::Log {
+                log_type: 0xb0ed,
+                body: LogBody::Nas4GMessage { msg, .. },
+                ..
+            } => assert_eq!(msg, &[0x07, 0x5d, 0x00]),
+            other => panic!("expected the 0xb0ed NAS log, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unwrapped_message_parses_as_before() {
+        let frame = hdlc_encapsulate(&NAS_LOG, &CRC_CCITT);
+        assert_is_the_nas_log(&Message::from_hdlc(&frame).unwrap());
+    }
+
+    #[test]
+    fn a_wrapped_message_parses_like_the_unwrapped_one() {
+        let frame = wrap(&[0x98, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00], &NAS_LOG);
+        assert_is_the_nas_log(&Message::from_hdlc(&frame).unwrap());
+    }
+
+    #[test]
+    fn the_32_bit_field_after_the_reserved_bytes_is_not_checked() {
+        let frame = wrap(&[0x98, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00], &NAS_LOG);
+        assert_is_the_nas_log(&Message::from_hdlc(&frame).unwrap());
+    }
+
+    #[test]
+    fn an_unknown_envelope_version_is_not_unwrapped() {
+        let frame = wrap(&[0x98, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00], &NAS_LOG);
+        assert!(Message::from_hdlc(&frame).is_err());
+    }
+
+    #[test]
+    fn nonzero_reserved_bytes_are_not_unwrapped() {
+        for reserved in [[0x01, 0x00], [0x00, 0x01]] {
+            let header = [0x98, 0x01, reserved[0], reserved[1], 0x01, 0x00, 0x00, 0x00];
+            let frame = wrap(&header, &NAS_LOG);
+            assert!(Message::from_hdlc(&frame).is_err(), "{reserved:?}");
+        }
+    }
+
+    #[test]
+    fn a_header_with_nothing_after_it_is_an_error() {
+        let frame = wrap(&[0x98, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00], &[]);
+        assert!(Message::from_hdlc(&frame).is_err());
+    }
+
+    #[test]
+    fn a_frame_shorter_than_the_header_does_not_panic() {
+        for len in 1..8 {
+            let header = [0x98, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
+            let frame = wrap(&header[..len], &[]);
+            assert!(Message::from_hdlc(&frame).is_err(), "{len}");
+        }
+    }
 }
