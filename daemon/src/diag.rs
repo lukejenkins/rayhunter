@@ -531,7 +531,9 @@ pub fn run_diag_read_thread(
     task_tracker: &TaskTracker,
     device: Device,
     mut qmdl_file_rx: Receiver<DiagDeviceCtrlMessage>,
-    qmdl_file_tx: Sender<DiagDeviceCtrlMessage>,
+    // Held, not used: while this task owns a sender, recv() never returns
+    // None, so the reader exits only on an explicit Exit, as before.
+    _qmdl_file_tx: Sender<DiagDeviceCtrlMessage>,
     ui_update_sender: Sender<display::DisplayState>,
     qmdl_store_lock: Arc<RwLock<RecordingStore>>,
     analysis_sender: Sender<AnalysisCtrlMessage>,
@@ -565,10 +567,17 @@ pub fn run_diag_read_thread(
             gps_fixed_coords,
             live,
         );
-        qmdl_file_tx
-            .send(DiagDeviceCtrlMessage::StartRecording { response_tx: None })
-            .await
-            .unwrap();
+        // Start the boot recording here rather than by sending StartRecording
+        // into our own channel. That channel holds one message and this task
+        // is its only reader, so if anything else (a web start or GPS post, a
+        // button press) filled the slot while the device was still being set
+        // up, the self-send waited forever: no recording, web requests that
+        // never answered, and an Exit on SIGTERM that never arrived.
+        {
+            let mut qmdl_store = qmdl_store_lock.write().await;
+            let result = diag_task.start(qmdl_store.deref_mut()).await;
+            diag_task.report_unanswered_start(result).await;
+        }
         loop {
             tokio::select! {
                 msg = qmdl_file_rx.recv() => {
