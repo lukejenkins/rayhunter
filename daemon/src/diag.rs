@@ -316,6 +316,20 @@ impl DiagTask {
         }
     }
 
+    /// A start that came with no reply channel (the one at daemon startup, or
+    /// the power button) has no caller to hand an error to. Log it and send it
+    /// to the notification channel, so a refused start isn't silent.
+    async fn report_unanswered_start(&mut self, result: Result<(), RecordingStoreError>) {
+        if let Err(e) = result {
+            let reason = format!("Recording did not start: {e}");
+            error!("{reason}");
+            self.notification_channel
+                .send(Notification::new(NotificationType::Warning, reason, None))
+                .await
+                .ok();
+        }
+    }
+
     async fn stop_current_recording(&mut self, qmdl_store: &mut RecordingStore) {
         crate::display::m2100_capture_profiles::note_stopped();
         self.live
@@ -562,8 +576,11 @@ pub fn run_diag_read_thread(
                         Some(DiagDeviceCtrlMessage::StartRecording { response_tx }) => {
                             let mut qmdl_store = qmdl_store_lock.write().await;
                             let result = diag_task.start(qmdl_store.deref_mut()).await;
-                            if let Some(tx) = response_tx {
-                                tx.send(result).ok();
+                            match response_tx {
+                                Some(tx) => {
+                                    tx.send(result).ok();
+                                }
+                                None => diag_task.report_unanswered_start(result).await,
                             }
                         },
                         Some(DiagDeviceCtrlMessage::StopRecording) => {
@@ -917,5 +934,59 @@ mod live_tests {
         let s = live.lock().unwrap().snapshot();
         assert_eq!(s.towers.len(), 1, "{s:?}");
         assert_eq!((s.towers[0].pci, s.towers[0].earfcn), (270, 1811));
+    }
+
+    fn task_with_notifications(
+        min_space_to_start_mb: u64,
+    ) -> (DiagTask, tokio::sync::mpsc::Receiver<Notification>) {
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::channel(8);
+        let (an_tx, _an_rx) = tokio::sync::mpsc::channel(8);
+        let (n_tx, n_rx) = tokio::sync::mpsc::channel(8);
+        let task = DiagTask::new(
+            ui_tx,
+            an_tx,
+            AnalyzerConfig::default(),
+            Device::Tmobile,
+            n_tx,
+            min_space_to_start_mb,
+            0,
+            GpsMode::Disabled,
+            None,
+            Arc::new(Mutex::new(LiveObservations::default())),
+        );
+        (task, n_rx)
+    }
+
+    #[tokio::test]
+    async fn a_refused_start_without_a_caller_sends_a_notification() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RecordingStore::create(dir.path()).await.unwrap();
+        // No filesystem has this much free space.
+        let (mut task, mut notifications) = task_with_notifications(u64::MAX);
+        let result = task.start(&mut store).await;
+        assert!(matches!(
+            result,
+            Err(RecordingStoreError::InsufficientDiskSpace(_, u64::MAX))
+        ));
+
+        task.report_unanswered_start(result).await;
+
+        assert!(notifications.try_recv().is_ok());
+        assert!(store.manifest.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_successful_start_sends_no_notification() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RecordingStore::create(dir.path()).await.unwrap();
+        let (mut task, mut notifications) = task_with_notifications(0);
+        let result = task.start(&mut store).await;
+        assert!(result.is_ok());
+
+        task.report_unanswered_start(result).await;
+
+        assert!(notifications.try_recv().is_err());
+        assert_eq!(store.manifest.entries.len(), 1);
+        task.stop_current_recording(&mut store).await;
     }
 }
