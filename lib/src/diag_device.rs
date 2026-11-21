@@ -482,10 +482,16 @@ fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> Dia
 // Unsure of what MDM actually stands for, but if `use_mdm` is > 0, then
 // an additional mask is included in every diag request
 fn determine_use_mdm(fd: i32) -> DiagResult<i32> {
-    let use_mdm: i32 = 0;
+    // The driver writes the remote-device mask through this pointer, so the
+    // binding must be mutable. Passing an immutable binding as `*const` lets
+    // the compiler assume it still holds 0 after the call.
+    let mut use_mdm: i32 = 0;
     unsafe {
-        if libc::ioctl(fd, DIAG_IOCTL_REMOTE_DEV, &use_mdm as *const i32) < 0 {
-            let msg = format!("DIAG_IOCTL_REMOTE_DEV ioctl failed with error code {}", 0);
+        if libc::ioctl(fd, DIAG_IOCTL_REMOTE_DEV, &mut use_mdm as *mut i32) < 0 {
+            let msg = format!(
+                "DIAG_IOCTL_REMOTE_DEV ioctl failed: {}",
+                std::io::Error::last_os_error()
+            );
             return Err(DiagDeviceError::InitializationFailed(msg));
         }
     }
