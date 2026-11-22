@@ -91,7 +91,33 @@ impl Client {
 
     /// REG_EVENTS with the NMEA event mask.
     pub fn register_nmea(&mut self) -> Outcome {
-        self.call(wire::MSG_REG_EVENTS, |t| wire::reg_events(t, EVENT_MASK_NMEA))
+        self.register(EVENT_MASK_NMEA)
+    }
+
+    /// REG_EVENTS with any event mask. It replaces this client's previous mask.
+    pub fn register(&mut self, mask: u64) -> Outcome {
+        self.call(wire::MSG_REG_EVENTS, |t| wire::reg_events(t, mask))
+    }
+
+    /// The next indication of any kind, as (message id, TLV area). `Ok(None)`
+    /// on timeout or signal, as in [`next_nmea`](Self::next_nmea). NMEA queued
+    /// during a request is not returned here.
+    pub fn next_indication(&mut self, timeout: Duration) -> io::Result<Option<(u16, Vec<u8>)>> {
+        let deadline = Instant::now() + timeout;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            let n = match self.recv(left) {
+                Ok(Some(n)) => n,
+                Ok(None) => return Ok(None),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            if let Some(m) = wire::Message::parse(&self.buf[..n]) {
+                if m.kind == wire::TYPE_INDICATION {
+                    return Ok(Some((m.msg_id, m.tlvs.to_vec())));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// SET_NMEA_TYPES. Callers wanting the firmware default skip this call.
