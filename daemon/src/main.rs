@@ -151,9 +151,33 @@ async fn init_qmdl_store(config: &config::Config) -> Result<RecordingStore, Rayh
     }
 }
 
-// Start a thread that'll track when user hits ctrl+c. When that happens,
-// trigger various cleanup tasks, including sending signals to other threads to
-// shutdown
+// Resolve on SIGINT (ctrl+c) or SIGTERM. Init scripts stop the daemon with
+// SIGTERM (busybox `start-stop-daemon -K`, systemd), and SIGTERM's default
+// action ends the process at once: the open recording is never finished and
+// its .qmdl.gz has no gzip trailer. Handling it here gives SIGTERM the same
+// clean shutdown as ctrl+c.
+async fn wait_for_termination_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        select! {
+            res = tokio::signal::ctrl_c() => res,
+            _ = sigterm.recv() => {
+                info!("got SIGTERM, shutting down");
+                Ok(())
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
+// Start a thread that'll track when the daemon is told to stop (ctrl+c or
+// SIGTERM). When that happens, trigger various cleanup tasks, including
+// sending signals to other threads to shutdown
 fn run_shutdown_thread(
     task_tracker: &TaskTracker,
     diag_device_sender: Sender<DiagDeviceCtrlMessage>,
@@ -165,7 +189,7 @@ fn run_shutdown_thread(
 
     task_tracker.spawn(async move {
         select! {
-            res = tokio::signal::ctrl_c() => {
+            res = wait_for_termination_signal() => {
                 if let Err(err) = res {
                     error!("Unable to listen for shutdown signal: {err}");
                 }
@@ -408,5 +432,25 @@ mod test {
     fn test_get_router() {
         // assert that creating the router does not panic from invalid route patterns.
         let _ = get_router();
+    }
+
+    // Once tokio has registered SIGTERM, the default action (end the process)
+    // no longer applies, so the test can signal itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_resolves_the_termination_wait() {
+        let waiter = tokio::spawn(wait_for_termination_signal());
+        // let the spawned task register its handlers before signalling
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success());
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("SIGTERM did not resolve wait_for_termination_signal")
+            .expect("waiter task panicked");
+        assert!(res.is_ok());
     }
 }
