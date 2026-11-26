@@ -360,7 +360,10 @@ struct DiagLoggingModeParamExt {
 fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> DiagResult<()> {
     unsafe {
         if libc::ioctl(fd, DIAG_IOCTL_SWITCH_LOGGING, mode, 0, 0, 0) < 0 {
-            info!("SWITCH_LOGGING by-value failed: {}", std::io::Error::last_os_error());
+            info!(
+                "SWITCH_LOGGING by-value failed: {}",
+                std::io::Error::last_os_error()
+            );
             let mut try_params = vec![DiagLoggingModeParam {
                 req_mode: mode,
                 peripheral_mask: u32::MAX,
@@ -429,9 +432,8 @@ fn enable_frame_readwrite(fd: i32, mode: u32, configured_device: &Device) -> Dia
 
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
-                let msg = format!(
-                    "DIAG_IOCTL_SWITCH_LOGGING ioctl failed with error code {ret} ({err})"
-                );
+                let msg =
+                    format!("DIAG_IOCTL_SWITCH_LOGGING ioctl failed with error code {ret} ({err})");
                 return Err(DiagDeviceError::InitializationFailed(msg));
             }
         }
